@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      # Pin third-party actions by commit SHA before relying on this in
+      # production (tags are mutable).
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Enable KVM for QEMU
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Toolchain
+        run: nix develop --command rustup show active-toolchain
+      - name: fmt + clippy (host and UEFI, with/without debug console)
+        run: nix develop --command cargo xtask lint
+      - name: Host tests (core, store fault injection, ui, escpos, app)
+        run: nix develop --command cargo xtask test
+      - name: Image build
+        run: nix develop --command cargo xtask image --release
+      - name: QEMU smoke
+        run: nix develop --command cargo xtask smoke --release
+      - name: QEMU end-to-end (sale, power cut, reboot, export)
+        run: nix develop --command cargo xtask e2e
+      - name: Secure Boot (ephemeral keys)
+        run: nix develop --command cargo xtask sb-test
+      - name: Reproducibility
+        run: nix develop --command cargo xtask repro
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pos-images
+          path: |
+            out/pos.img
+            out/BOOTX64.EFI
+            out/printer_boot1.bin
+            out/*.ppm
+            out/console.log

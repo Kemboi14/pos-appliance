@@ -13,6 +13,8 @@
           rustup          # honours rust-toolchain.toml
           qemu            # qemu-system-x86_64
           OVMF.fd         # UEFI firmware for QEMU
+          OVMFFull.fd     # Secure Boot + SMM build (sb-test)
+          python3Packages.virt-firmware  # virt-fw-vars: enroll SB keys
           sbsigntool      # sbsign / sbverify
           efitools        # cert-to-efi-sig-list, sign-efi-sig-list
           openssl
@@ -21,6 +23,8 @@
         ];
         OVMF_CODE = "${pkgs.OVMF.fd}/FV/OVMF_CODE.fd";
         OVMF_VARS = "${pkgs.OVMF.fd}/FV/OVMF_VARS.fd";
+        OVMF_SB_CODE = "${pkgs.OVMFFull.fd}/FV/OVMF_CODE.fd";
+        OVMF_SB_VARS = "${pkgs.OVMFFull.fd}/FV/OVMF_VARS.fd";
         shellHook = ''
           export SOURCE_DATE_EPOCH=''${SOURCE_DATE_EPOCH:-1700000000}
         '';

@@ -17,6 +17,8 @@ pub struct QemuOpts {
     pub qmp: Option<PathBuf>,
     /// Fresh copy of OVMF_VARS for each run unless false.
     pub reset_vars: bool,
+    /// Use the Secure Boot (SMM) OVMF build with this pre-enrolled varstore.
+    pub secure_vars: Option<PathBuf>,
 }
 
 fn env_path(var: &str) -> Res<PathBuf> {
@@ -30,10 +32,12 @@ fn env_path(var: &str) -> Res<PathBuf> {
 }
 
 pub fn spawn(o: &QemuOpts) -> Res<Child> {
-    let code = env_path("OVMF_CODE")?;
-    let vars_src = env_path("OVMF_VARS")?;
+    let (code, vars_src) = match &o.secure_vars {
+        Some(v) => (env_path("OVMF_SB_CODE")?, v.clone()),
+        None => (env_path("OVMF_CODE")?, env_path("OVMF_VARS")?),
+    };
     let vars = o.out_dir.join("ovmf_vars.fd");
-    if o.reset_vars || !vars.exists() {
+    if o.reset_vars || o.secure_vars.is_some() || !vars.exists() {
         std::fs::copy(&vars_src, &vars)?;
         let mut perm = std::fs::metadata(&vars)?.permissions();
         #[allow(clippy::permissions_set_readonly_false)]
@@ -44,7 +48,13 @@ pub fn spawn(o: &QemuOpts) -> Res<Child> {
     let console = o.out_dir.join("console.log");
 
     let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.args(["-machine", "q35", "-m", "512M", "-smp", "1"]);
+    if o.secure_vars.is_some() {
+        // The Secure Boot build keeps its varstore behind SMM.
+        cmd.args(["-machine", "q35,smm=on", "-m", "512M", "-smp", "1"]);
+        cmd.args(["-global", "driver=cfi.pflash01,property=secure,value=on"]);
+    } else {
+        cmd.args(["-machine", "q35", "-m", "512M", "-smp", "1"]);
+    }
     if Path::new("/dev/kvm").exists() && std::fs::File::open("/dev/kvm").is_ok() {
         cmd.args(["-enable-kvm", "-cpu", "host"]);
     } else {

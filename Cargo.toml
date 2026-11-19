@@ -8,7 +8,6 @@ members = [
     "pos-escpos",
     "pos-app",
     "platform-uefi",
-    "kernel",
     "xtask",
 ]
 # Host-testable crates. The firmware/kernel binaries are built by xtask with

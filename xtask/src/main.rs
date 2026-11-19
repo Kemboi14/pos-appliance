@@ -56,6 +56,7 @@ fn run(args: &[String]) -> Res<()> {
                 headless: f.headless,
                 qmp: None,
                 reset_vars: true,
+                secure_vars: None,
             })?;
             child.wait()?;
             Ok(())
@@ -63,6 +64,9 @@ fn run(args: &[String]) -> Res<()> {
         "smoke" => smoke(&f),
         "shot" => shot(&f),
         "e2e" => e2e(),
+        "keys" => keys(&keys_dir(&f)?),
+        "sign" => sign(&keys_dir(&f)?).map(|_| ()),
+        "sb-test" => sb_test(&keys_dir(&f)?),
         "repro" => repro(),
         "test" => host_tests(),
         "lint" => lint(),
@@ -86,6 +90,9 @@ fn run(args: &[String]) -> Res<()> {
                  repro    build the release image twice from clean and compare hashes\n\
                  test     host test suite (core/store/ui/escpos/app)\n\
                  lint     rustfmt --check + clippy -D warnings (host and UEFI)\n\
+                 keys     generate Secure Boot PK/KEK/db (keys/, private keys git-ignored)\n\
+                 sign     sign the release BOOTX64.EFI and build out/pos-signed.img\n\
+                 sb-test  OVMF with Secure Boot enforced: signed boots, unsigned refused\n\
                  ci       lint + test + smoke + e2e + repro"
             );
             Ok(())
@@ -229,8 +236,6 @@ fn host_tests() -> Res<()> {
         "--workspace",
         "--exclude",
         "platform-uefi",
-        "--exclude",
-        "kernel",
     ]))
 }
 
@@ -245,8 +250,6 @@ fn lint() -> Res<()> {
         "--workspace",
         "--exclude",
         "platform-uefi",
-        "--exclude",
-        "kernel",
         "--all-targets",
         "--",
         "-D",
@@ -291,6 +294,7 @@ fn smoke(f: &Flags) -> Res<()> {
         headless: true,
         qmp: Some(qmp_path.clone()),
         reset_vars: true,
+        secure_vars: None,
     })?;
     let res = (|| -> Res<()> {
         let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
@@ -377,6 +381,7 @@ fn shot(f: &Flags) -> Res<()> {
         headless: true,
         qmp: Some(qmp_path.clone()),
         reset_vars: true,
+        secure_vars: None,
     })?;
     let res = (|| -> Res<()> {
         let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
@@ -437,6 +442,7 @@ fn e2e() -> Res<()> {
         headless: true,
         qmp: Some(qmp_path.clone()),
         reset_vars,
+        secure_vars: None,
     };
     let pause = |ms| std::thread::sleep(Duration::from_millis(ms));
 
@@ -546,6 +552,231 @@ fn e2e() -> Res<()> {
             "committed before"
         } else {
             "lost to"
+        }
+    );
+    Ok(())
+}
+
+// ------------------------------------------------------------ Secure Boot
+
+fn keys_dir(f: &Flags) -> Res<PathBuf> {
+    Ok(match &f.keys {
+        Some(k) => k.clone(),
+        None => root()?.join("keys"),
+    })
+}
+
+fn run_ok(cmd: &mut Command) -> Res<()> {
+    sh(cmd.stdout(std::process::Stdio::null()))
+}
+
+/// Generate a self-contained Secure Boot hierarchy:
+/// PK (platform owner) → KEK → db (signs BOOTX64.EFI). RSA-2048/SHA-256,
+/// which every UEFI 2.3.1+ firmware accepts. Produces PEM keys/certs, DER
+/// certs (for firmware setup UIs) and signed .auth updates (for
+/// KeyTool/firmware "append from file" enrollment).
+fn keys(dir: &Path) -> Res<()> {
+    std::fs::create_dir_all(dir)?;
+    if dir.join("db.key").exists() {
+        println!(
+            "keys: {} already contains keys; not overwriting",
+            dir.display()
+        );
+        return Ok(());
+    }
+    let guid_path = dir.join("GUID.txt");
+    let guid = match std::fs::read_to_string(&guid_path) {
+        Ok(g) => g.trim().to_string(),
+        Err(_) => {
+            let out = Command::new("python3")
+                .args(["-c", "import uuid;print(uuid.uuid4())"])
+                .output()?;
+            let g = String::from_utf8(out.stdout)?.trim().to_string();
+            std::fs::write(&guid_path, format!("{g}\n"))?;
+            g
+        }
+    };
+    for (name, cn) in [
+        ("PK", "POS Platform Key"),
+        ("KEK", "POS Key Exchange Key"),
+        ("db", "POS Signing Key"),
+    ] {
+        run_ok(Command::new("openssl").current_dir(dir).args([
+            "req",
+            "-new",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-days",
+            "3650",
+            "-nodes",
+            "-subj",
+            &format!("/CN={cn}/"),
+            "-keyout",
+            &format!("{name}.key"),
+            "-out",
+            &format!("{name}.crt"),
+        ]))?;
+        run_ok(Command::new("openssl").current_dir(dir).args([
+            "x509",
+            "-in",
+            &format!("{name}.crt"),
+            "-outform",
+            "DER",
+            "-out",
+            &format!("{name}.cer"),
+        ]))?;
+        run_ok(Command::new("cert-to-efi-sig-list").current_dir(dir).args([
+            "-g",
+            &guid,
+            &format!("{name}.crt"),
+            &format!("{name}.esl"),
+        ]))?;
+    }
+    // PK and KEK are signed by PK; db by KEK.
+    for (var, signer) in [("PK", "PK"), ("KEK", "PK"), ("db", "KEK")] {
+        run_ok(Command::new("sign-efi-sig-list").current_dir(dir).args([
+            "-g",
+            &guid,
+            "-k",
+            &format!("{signer}.key"),
+            "-c",
+            &format!("{signer}.crt"),
+            var,
+            &format!("{var}.esl"),
+            &format!("{var}.auth"),
+        ]))?;
+    }
+    #[cfg(unix)]
+    for k in ["PK.key", "KEK.key", "db.key"] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join(k), std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!(
+        "keys: generated PK/KEK/db in {} (owner GUID {guid})",
+        dir.display()
+    );
+    println!("keys: keep *.key OFFLINE; only *.cer/*.auth go to the till firmware");
+    Ok(())
+}
+
+/// Sign the release EFI with db and build out/pos-signed.img.
+fn sign(dir: &Path) -> Res<PathBuf> {
+    if !dir.join("db.key").exists() {
+        return Err(format!("no keys in {}; run `cargo xtask keys` first", dir.display()).into());
+    }
+    let efi = build_efi(&Flags {
+        release: true,
+        ..Flags::default()
+    })?;
+    let out = out_dir()?;
+    let signed = out.join("BOOTX64.signed.EFI");
+    let _ = std::fs::remove_file(&signed);
+    run_ok(Command::new("sbsign").args([
+        "--key",
+        &dir.join("db.key").display().to_string(),
+        "--cert",
+        &dir.join("db.crt").display().to_string(),
+        "--output",
+        &signed.display().to_string(),
+        &efi.display().to_string(),
+    ]))?;
+    run_ok(Command::new("sbverify").args([
+        "--cert",
+        &dir.join("db.crt").display().to_string(),
+        &signed.display().to_string(),
+    ]))?;
+    let img = out.join("pos-signed.img");
+    make_image(&std::fs::read(&signed)?, &img)?;
+    println!(
+        "signed BOOTX64.EFI sha256 {}",
+        sha256_hex(&std::fs::read(&signed)?)
+    );
+    println!(
+        "pos-signed.img sha256 {}",
+        sha256_hex(&std::fs::read(&img)?)
+    );
+    Ok(img)
+}
+
+/// Enroll our PK/KEK/db (no Microsoft keys) into a Secure Boot OVMF
+/// varstore with enforcement on; the signed image must boot to the POS UI,
+/// the unsigned one must be refused by the firmware.
+fn sb_test(dir: &Path) -> Res<()> {
+    keys(dir)?;
+    let signed = sign(dir)?;
+    let out = out_dir()?;
+    let guid = std::fs::read_to_string(dir.join("GUID.txt"))?
+        .trim()
+        .to_string();
+    let vars = out.join("sb_vars.fd");
+    let _ = std::fs::remove_file(&vars);
+    sh(Command::new("virt-fw-vars")
+        .arg("--input")
+        .arg(std::env::var("OVMF_SB_VARS").map_err(|_| "OVMF_SB_VARS not set (nix develop)")?)
+        .args(["--set-pk", &guid, &dir.join("PK.crt").display().to_string()])
+        .args([
+            "--add-kek",
+            &guid,
+            &dir.join("KEK.crt").display().to_string(),
+        ])
+        .args(["--add-db", &guid, &dir.join("db.crt").display().to_string()])
+        .args([
+            "--no-microsoft",
+            "--sb",
+            "--output",
+            &vars.display().to_string(),
+        ]))?;
+    let qmp_path = out.join("qmp.sock");
+    let opts = |image: PathBuf| qemu::QemuOpts {
+        image,
+        media: None,
+        out_dir: out.clone(),
+        headless: true,
+        qmp: Some(qmp_path.clone()),
+        reset_vars: true,
+        secure_vars: Some(vars.clone()),
+    };
+    // Signed: must reach the UI.
+    let mut child = qemu::spawn(&opts(signed))?;
+    let r = (|| -> Res<()> {
+        let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
+        wait_ui(&mut q, &out, Duration::from_secs(120))?;
+        q.quit()
+    })();
+    stop_qemu(&mut child);
+    r.map_err(|e| format!("sb-test: signed image did not boot: {e}"))?;
+    println!("sb-test: signed image boots with Secure Boot enforced");
+    // Unsigned: must NOT reach the UI.
+    let unsigned = out.join("pos-unsigned.img");
+    make_image(
+        &std::fs::read(build_efi(&Flags {
+            release: true,
+            ..Flags::default()
+        })?)?,
+        &unsigned,
+    )?;
+    let mut child = qemu::spawn(&opts(unsigned))?;
+    let r = (|| -> Res<bool> {
+        let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
+        let booted = wait_ui(&mut q, &out, Duration::from_secs(45)).is_ok();
+        q.quit()?;
+        Ok(booted)
+    })();
+    stop_qemu(&mut child);
+    if r? {
+        return Err("sb-test: UNSIGNED image booted with Secure Boot on".into());
+    }
+    let log = std::fs::read(out.join("console.log")).unwrap_or_default();
+    let denied =
+        log.windows(13).any(|w| w == b"Access Denied") || log.windows(9).any(|w| w == b"Violation");
+    println!(
+        "sb-test: unsigned image refused{}",
+        if denied {
+            " (firmware reported Access Denied / Security Violation)"
+        } else {
+            ""
         }
     );
     Ok(())

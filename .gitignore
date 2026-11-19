@@ -1,6 +1,6 @@
 /target
 /out
-/keys/*.key
-/keys/*.auth
+# Secure Boot keys are per-deployment secrets: never commit them.
+/keys/
 *.img
 *.ppm
