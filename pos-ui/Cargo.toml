@@ -10,4 +10,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+embedded-graphics = { version = "=0.8.2", default-features = false }
 pos-hal.workspace = true

@@ -664,13 +664,14 @@ impl<D: BlockDevice> Store<D> {
     pub fn bind(&mut self, key: &[u8; 32], store_id: Option<[u8; 16]>) -> SResult<()> {
         let mut sb = self.sb;
         if let Some(id) = store_id
-            && id != sb.store_id {
-                if sb.snap.valid || self.head.seq != 1 {
-                    return Err(StoreError::NotEmpty);
-                }
-                sb = fresh_sb(self.g, id);
-                sb.generation = self.sb.generation;
+            && id != sb.store_id
+        {
+            if sb.snap.valid || self.head.seq != 1 {
+                return Err(StoreError::NotEmpty);
             }
+            sb = fresh_sb(self.g, id);
+            sb.generation = self.sb.generation;
+        }
         sb.flags |= SB_FLAG_BOUND;
         sb.epoch = self.sb.epoch.wrapping_add(1);
         self.key = *key;
