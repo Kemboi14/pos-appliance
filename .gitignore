@@ -1,0 +1,6 @@
+/target
+/out
+/keys/*.key
+/keys/*.auth
+*.img
+*.ppm

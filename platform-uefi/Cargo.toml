@@ -1,0 +1,26 @@
+[package]
+name = "platform-uefi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "pos-uefi"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+default = []
+# Text logging to ConOut/serial. Never enabled in release images: the xtask
+# release path rejects it (see xtask/src/main.rs, `check_release_features`).
+debug-console = ["uefi/logger"]
+
+[dependencies]
+uefi.workspace = true
+pos-hal.workspace = true

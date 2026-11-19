@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = [
+    "pos-core",
+    "pos-hal",
+    "pos-store",
+    "pos-ui",
+    "pos-escpos",
+    "pos-app",
+    "platform-uefi",
+    "kernel",
+    "xtask",
+]
+# Host-testable crates. The firmware/kernel binaries are built by xtask with
+# an explicit --target; they are not part of a plain `cargo test`.
+default-members = [
+    "pos-core",
+    "pos-hal",
+    "pos-store",
+    "pos-ui",
+    "pos-escpos",
+    "pos-app",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+pos-core = { path = "pos-core" }
+pos-hal = { path = "pos-hal" }
+pos-store = { path = "pos-store" }
+pos-ui = { path = "pos-ui" }
+pos-escpos = { path = "pos-escpos" }
+pos-app = { path = "pos-app" }
+
+serde = { version = "=1.0.229", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }
+blake3 = { version = "=1.8.7", default-features = false }
+argon2 = { version = "=0.6.0", default-features = false, features = ["alloc"] }
+uefi = { version = "=0.41.0", features = ["alloc", "global_allocator"] }
+proptest = { version = "=1.12.0" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+float_arithmetic = "deny"
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = "symbols"
+incremental = false

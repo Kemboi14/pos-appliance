@@ -1,0 +1,6 @@
+# Pinned for reproducible builds. Stable only: no nightly features are used.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["clippy", "rustfmt", "rust-src"]
+targets = ["x86_64-unknown-uefi", "x86_64-unknown-none"]
