@@ -498,6 +498,7 @@ dependencies = [
 name = "pos-core"
 version = "0.1.0"
 dependencies = [
+ "postcard",
  "proptest",
  "serde",
 ]

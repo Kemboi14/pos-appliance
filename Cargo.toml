@@ -55,6 +55,9 @@ undocumented_unsafe_blocks = "deny"
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+# Money literals are written major_minor: 116_00 means 116.00 in cents.
+inconsistent_digit_grouping = "allow"
+mistyped_literal_suffixes = "allow"
 
 [profile.dev]
 panic = "abort"
