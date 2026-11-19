@@ -110,21 +110,24 @@ impl Cart {
         if line.qty.0 <= 0 || line.qty.0 > MAX_QTY {
             return Err(CartError::BadQty);
         }
-        if line.fixed_amount.is_none() && line.discount.is_none() && line.qty.is_whole()
+        if line.fixed_amount.is_none()
+            && line.discount.is_none()
+            && line.qty.is_whole()
             && let Some((i, l)) = self.lines.iter_mut().enumerate().rev().find(|(_, l)| {
                 l.sku == line.sku
                     && l.unit_price == line.unit_price
                     && l.fixed_amount.is_none()
                     && l.discount.is_none()
                     && l.qty.is_whole()
-            }) {
-                let q = l.qty.0.checked_add(line.qty.0).ok_or(CartError::BadQty)?;
-                if q > MAX_QTY {
-                    return Err(CartError::BadQty);
-                }
-                l.qty = Qty(q);
-                return Ok(i);
+            })
+        {
+            let q = l.qty.0.checked_add(line.qty.0).ok_or(CartError::BadQty)?;
+            if q > MAX_QTY {
+                return Err(CartError::BadQty);
             }
+            l.qty = Qty(q);
+            return Ok(i);
+        }
         if self.lines.len() >= MAX_LINES {
             return Err(CartError::TooManyLines);
         }

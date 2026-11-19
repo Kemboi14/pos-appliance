@@ -117,31 +117,34 @@ impl Catalog {
             it.barcode = Some(barcode::normalize_code(b).map_err(CatalogError::Barcode)?);
         }
         if let Some(p) = &it.plu
-            && (p.len() != 5 || !p.bytes().all(|c| c.is_ascii_digit())) {
-                return Err(CatalogError::BadPlu);
-            }
+            && (p.len() != 5 || !p.bytes().all(|c| c.is_ascii_digit()))
+        {
+            return Err(CatalogError::BadPlu);
+        }
         Ok(it)
     }
 
     fn check_unique(&self, it: &Item) -> Result<(), CatalogError> {
         if let Some(b) = &it.barcode
             && let Some(owner) = self.by_barcode.get(b)
-                && *owner != it.sku {
-                    return Err(CatalogError::DuplicateBarcode(b.clone()));
-                }
+            && *owner != it.sku
+        {
+            return Err(CatalogError::DuplicateBarcode(b.clone()));
+        }
         if let Some(p) = &it.plu
             && let Some(owner) = self.by_plu.get(p)
-                && *owner != it.sku {
-                    return Err(CatalogError::DuplicatePlu(p.clone()));
-                }
+            && *owner != it.sku
+        {
+            return Err(CatalogError::DuplicatePlu(p.clone()));
+        }
         if let Some(q) = it.quick_key
             && self
                 .items
                 .values()
                 .any(|o| o.quick_key == Some(q) && o.sku != it.sku)
-            {
-                return Err(CatalogError::DuplicateQuickKey(q));
-            }
+        {
+            return Err(CatalogError::DuplicateQuickKey(q));
+        }
         Ok(())
     }
 

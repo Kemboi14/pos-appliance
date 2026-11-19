@@ -160,6 +160,7 @@ impl Qmp {
 
     /// Press and release one key given as a QEMU qcode (e.g. "a", "ret",
     /// "shift"), optionally with modifiers held.
+#[allow(dead_code)] // used by the M5 end-to-end test
     pub fn key(&mut self, qcode: &str, mods: &[&str]) -> Res<()> {
         let mut keys: Vec<String> = mods
             .iter()
@@ -174,6 +175,7 @@ impl Qmp {
     }
 
     /// Type an ASCII string with `delay` between characters.
+#[allow(dead_code)] // used by the M5 end-to-end test
     pub fn type_str(&mut self, s: &str, delay: Duration) -> Res<()> {
         for c in s.chars() {
             let (code, shift) = qcode_for(c).ok_or_else(|| format!("no qcode for {c:?}"))?;
@@ -194,6 +196,7 @@ impl Qmp {
     }
 }
 
+#[allow(dead_code)] // used by the M5 end-to-end test
 pub fn qcode_for(c: char) -> Option<(&'static str, bool)> {
     const LOWER: [&str; 26] = [
         "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",

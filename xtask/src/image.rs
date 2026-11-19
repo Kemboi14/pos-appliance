@@ -254,6 +254,7 @@ pub fn build_media_image(
 }
 
 /// Read a file back out of the FAT partition of a media image (for tests).
+#[allow(dead_code)] // used by the M5 end-to-end test
 pub fn read_media_file(img: &Path, name: &str) -> Res<Option<Vec<u8>>> {
     let data = fs::read(img)?;
     let start = usize::try_from(MIB)?;

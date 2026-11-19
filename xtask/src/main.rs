@@ -173,8 +173,12 @@ fn build_efi(f: &Flags) -> Res<PathBuf> {
     Ok(out)
 }
 
-fn data_partition_init() -> Vec<u8> {
-    Vec::new()
+/// Two blank, unbound superblocks (pos-store format). The device binds the
+/// store to itself and assigns a random store id on first boot.
+fn data_partition_init() -> Res<Vec<u8>> {
+    let l = image::layout(IMAGE_MIB, ESP_MIB);
+    pos_store::format_image(image::SECTOR as usize, l.data_sectors)
+        .map_err(|e| format!("format data partition: {e:?}").into())
 }
 
 fn make_image(efi: &[u8], out: &Path) -> Res<()> {
@@ -183,7 +187,7 @@ fn make_image(efi: &[u8], out: &Path) -> Res<()> {
         IMAGE_MIB,
         ESP_MIB,
         efi,
-        &data_partition_init(),
+        &data_partition_init()?,
         source_date_epoch(),
     )?;
     eprintln!(
