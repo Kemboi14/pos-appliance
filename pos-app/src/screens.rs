@@ -956,10 +956,11 @@ fn execute<D: BlockDevice>(
         }
         Pending::Export => {
             if !events.is_empty()
-                && let Err(e) = app.commit(events) {
-                    app.err(&e);
-                    return back_to_work(app);
-                }
+                && let Err(e) = app.commit(events)
+            {
+                app.err(&e);
+                return back_to_work(app);
+            }
             match crate::export::export(app, hw, by, now) {
                 Ok(summary) => app.set_msg(summary, false),
                 Err(e) => app.set_msg(e, true),
@@ -982,18 +983,20 @@ fn execute<D: BlockDevice>(
         }
         Pending::AddUser(role) => {
             if !events.is_empty()
-                && let Err(e) = app.commit(events) {
-                    app.err(&e);
-                    return back_to_work(app);
-                }
+                && let Err(e) = app.commit(events)
+            {
+                app.err(&e);
+                return back_to_work(app);
+            }
             prompt("New user", "Name", false, Next::AddUserName(role))
         }
         Pending::Unlock => {
             if !events.is_empty()
-                && let Err(e) = app.commit(events) {
-                    app.err(&e);
-                    return back_to_work(app);
-                }
+                && let Err(e) = app.commit(events)
+            {
+                app.err(&e);
+                return back_to_work(app);
+            }
             prompt(
                 "Unlock user",
                 "User number to unlock",

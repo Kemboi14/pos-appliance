@@ -45,10 +45,11 @@ pub fn export<D: BlockDevice>(
                 }
             };
             if let Event::Report(rep) = &e
-                && rep.kind == ReportKind::Z {
-                    let name = format!("Z{:06}.CSV", rep.z_no.unwrap_or(0));
-                    files.push((name, csv::report_to_csv(rep, &cfg).into_bytes()));
-                }
+                && rep.kind == ReportKind::Z
+            {
+                let name = format!("Z{:06}.CSV", rep.z_no.unwrap_or(0));
+                files.push((name, csv::report_to_csv(rep, &cfg).into_bytes()));
+            }
             chunk.push_str(&csv::journal_row(r.seq, &hex(&r.hash), &e, &cfg));
             first.get_or_insert(r.seq);
             last = r.seq;

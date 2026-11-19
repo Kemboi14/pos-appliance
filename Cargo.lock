@@ -519,8 +519,12 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "platform-uefi"
 version = "0.1.0"
 dependencies = [
+ "log",
+ "pos-app",
  "pos-hal",
+ "pos-ui",
  "uefi",
+ "uefi-raw",
 ]
 
 [[package]]

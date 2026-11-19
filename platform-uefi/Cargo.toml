@@ -19,8 +19,12 @@ bench = false
 default = []
 # Text logging to ConOut/serial. Never enabled in release images: the xtask
 # release path rejects it (see xtask/src/main.rs, `check_release_features`).
-debug-console = ["uefi/logger"]
+debug-console = ["uefi/logger", "dep:log"]
 
 [dependencies]
 uefi.workspace = true
+uefi-raw = "=0.17.0"
 pos-hal.workspace = true
+pos-app.workspace = true
+pos-ui.workspace = true
+log = { version = "0.4", optional = true }

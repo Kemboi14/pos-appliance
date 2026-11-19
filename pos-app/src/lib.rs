@@ -311,6 +311,11 @@ impl<D: BlockDevice> App<D> {
     pub fn message(&self) -> Option<&str> {
         self.message.as_ref().map(|(m, _)| m.as_str())
     }
+    /// Show a message in the status bar (platform warnings).
+    pub fn notice(&mut self, msg: &str, error: bool) {
+        self.set_msg(msg, error);
+    }
+
     pub fn store_trust(&self) -> Option<Trust> {
         self.store.as_ref().map(Store::trust)
     }
@@ -352,9 +357,11 @@ impl<D: BlockDevice> App<D> {
         };
         if store.records_since_snapshot() >= every
             && let Ok(bytes) = postcard::to_allocvec(&self.state)
-                && store.write_snapshot(&bytes).is_err() && store.is_poisoned() {
-                    self.fatal = true;
-                }
+            && store.write_snapshot(&bytes).is_err()
+            && store.is_poisoned()
+        {
+            self.fatal = true;
+        }
         Ok(committed)
     }
 

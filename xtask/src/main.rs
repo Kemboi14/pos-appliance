@@ -61,6 +61,8 @@ fn run(args: &[String]) -> Res<()> {
             Ok(())
         }
         "smoke" => smoke(&f),
+        "shot" => shot(&f),
+        "e2e" => e2e(),
         "repro" => repro(),
         "test" => host_tests(),
         "lint" => lint(),
@@ -68,6 +70,7 @@ fn run(args: &[String]) -> Res<()> {
             lint()?;
             host_tests()?;
             smoke(&Flags::default())?;
+            e2e()?;
             repro()
         }
         _ => {
@@ -77,11 +80,13 @@ fn run(args: &[String]) -> Res<()> {
                  build    build BOOTX64.EFI into out/\n\
                  image    build out/pos.img (GPT: ESP + POS data partition)\n\
                  qemu     boot out/pos.img in QEMU/OVMF (printer bytes -> out/printer.bin)\n\
-                 smoke    M0 acceptance: headless boot, screendump, check test pattern\n\
+                 smoke    headless boot, screendump, check the UI came up\n\
+                 e2e      QEMU end-to-end: setup, import, sale, power cut, reboot, export\n\
+                 shot     boot headless and save a screendump (out/shot.ppm)\n\
                  repro    build the release image twice from clean and compare hashes\n\
                  test     host test suite (core/store/ui/escpos/app)\n\
                  lint     rustfmt --check + clippy -D warnings (host and UEFI)\n\
-                 ci       lint + test + smoke + repro"
+                 ci       lint + test + smoke + e2e + repro"
             );
             Ok(())
         }
@@ -273,7 +278,8 @@ fn lint() -> Res<()> {
     ]))
 }
 
-/// M0 acceptance: boot headless, take a screendump, verify the test pattern.
+/// Boot headless and wait until the POS UI is on screen (status bar colour
+/// at the top-left, app background below it).
 fn smoke(f: &Flags) -> Res<()> {
     let img = image(f)?;
     let out = out_dir()?;
@@ -288,30 +294,34 @@ fn smoke(f: &Flags) -> Res<()> {
     })?;
     let res = (|| -> Res<()> {
         let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
-        let shot = out.join("smoke.ppm");
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            std::thread::sleep(Duration::from_secs(2));
-            q.screendump(&shot)?;
-            std::thread::sleep(Duration::from_millis(300));
-            if let Ok(img) = qemu::read_ppm(&shot) {
-                let (w, h) = (img.0, img.1);
-                let center = qemu::pixel(&img, w / 2, h / 2);
-                let corner = qemu::pixel(&img, w - 5, h - 5);
-                if center == 0x00F0_A000 && corner == 0x001E_3A5F {
-                    println!("smoke: OK - GOP mode {w}x{h}, test pattern verified");
-                    q.quit()?;
-                    return Ok(());
-                }
-            }
-            if std::time::Instant::now() > deadline {
-                q.quit()?;
-                return Err("smoke: test pattern not seen within 60 s (see out/smoke.ppm)".into());
-            }
-        }
+        let (w, h) = wait_ui(&mut q, &out, Duration::from_secs(90))?;
+        println!("smoke: OK - POS UI up at {w}x{h}");
+        q.quit()
     })();
     stop_qemu(&mut child);
     res
+}
+
+const UI_PANEL: u32 = 0x0022_2A35;
+const UI_BG: u32 = 0x0016_1B22;
+
+fn wait_ui(q: &mut qemu::Qmp, out: &Path, timeout: Duration) -> Res<(usize, usize)> {
+    let shot = out.join("ui.ppm");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        std::thread::sleep(Duration::from_millis(700));
+        q.screendump(&shot)?;
+        std::thread::sleep(Duration::from_millis(200));
+        if let Ok(img) = qemu::read_ppm(&shot) {
+            let (w, h) = (img.0, img.1);
+            if qemu::pixel(&img, 2, 2) == UI_PANEL && qemu::pixel(&img, 2, h / 2) == UI_BG {
+                return Ok((w, h));
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("POS UI did not appear (see out/ui.ppm)".into());
+        }
+    }
 }
 
 /// Build the release image twice in separate clean target dirs and compare.
@@ -353,4 +363,190 @@ fn stop_qemu(child: &mut std::process::Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Boot headless, wait, take a screendump to out/shot.ppm (debugging aid).
+fn shot(f: &Flags) -> Res<()> {
+    let img = image(f)?;
+    let out = out_dir()?;
+    let qmp_path = out.join("qmp.sock");
+    let mut child = qemu::spawn(&qemu::QemuOpts {
+        image: img,
+        media: Some(media_image()?),
+        out_dir: out.clone(),
+        headless: true,
+        qmp: Some(qmp_path.clone()),
+        reset_vars: true,
+    })?;
+    let res = (|| -> Res<()> {
+        let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
+        let secs: u64 = std::env::var("SHOT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15);
+        std::thread::sleep(Duration::from_secs(secs));
+        q.screendump(&out.join("shot.ppm"))?;
+        std::thread::sleep(Duration::from_millis(500));
+        q.quit()
+    })();
+    stop_qemu(&mut child);
+    res
+}
+
+const E2E_CATALOG: &str = "sku,barcode,plu,name,price,tax_code,weighable,quick_key\r\n\
+MILK,4006381333931,,Milk 1L,1.20,A,0,0\r\n\
+BREAD,96385074,,Bread,2.49,A,0,1\r\n";
+
+/// M5 acceptance in QEMU/OVMF:
+/// boot 1: first-time setup, sign in, open shift, import catalog from the
+///   second USB stick, sell one item for cash (receipt + drawer kick must
+///   reach the printer), start a second sale and cut power (QMP quit) right
+///   after confirming payment;
+/// boot 2 (same NVRAM, same disks): sign in, export to USB;
+/// then check on the host: journal CSV has a gap-free receipt sequence that
+///   includes receipt 1, its hash chain column is populated, and the printer
+///   capture holds receipt #1.
+fn e2e() -> Res<()> {
+    // E2E_DEBUG=1 runs a debug build with the serial debug console.
+    let f = if std::env::var_os("E2E_DEBUG").is_some() {
+        Flags {
+            debug_console: true,
+            ..Flags::default()
+        }
+    } else {
+        Flags {
+            release: true,
+            ..Flags::default()
+        }
+    };
+    let img = image(&f)?;
+    let out = out_dir()?;
+    let media = out.join("media.img");
+    image::build_media_image(
+        &media,
+        64,
+        &[("CATALOG.CSV", E2E_CATALOG.as_bytes())],
+        source_date_epoch(),
+    )?;
+    let qmp_path = out.join("qmp.sock");
+    let human = Duration::from_millis(120);
+    let opts = |reset_vars| qemu::QemuOpts {
+        image: img.clone(),
+        media: Some(media.clone()),
+        out_dir: out.clone(),
+        headless: true,
+        qmp: Some(qmp_path.clone()),
+        reset_vars,
+    };
+    let pause = |ms| std::thread::sleep(Duration::from_millis(ms));
+
+    // ---------------- boot 1
+    let mut child = qemu::spawn(&opts(true))?;
+    let r1 = (|| -> Res<()> {
+        let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
+        wait_ui(&mut q, &out, Duration::from_secs(90))?;
+        q.type_str("Alice\n", human)?;
+        q.type_str("1234\n", human)?;
+        q.type_str("1234\n", human)?;
+        pause(1500);
+        q.type_str("1\n", human)?;
+        q.type_str("1234\n", human)?;
+        pause(1500);
+        q.screendump(&out.join("e2e_0_login.ppm"))?;
+        q.type_str("100.00\n", human)?;
+        pause(500);
+        q.key("f10", &[])?;
+        pause(300);
+        q.type_str("8", human)?; // import catalog
+        pause(2000);
+        q.screendump(&out.join("e2e_1_import.ppm"))?;
+        q.type_str("4006381333931\n", human)?;
+        pause(300);
+        q.key("f1", &[])?;
+        pause(300);
+        q.key("ret", &[])?; // exact cash
+        pause(2500);
+        q.screendump(&out.join("e2e_2_sale.ppm"))?;
+        q.key("esc", &[])?;
+        pause(300);
+        q.type_str("96385074\n", human)?;
+        pause(300);
+        q.key("f1", &[])?;
+        pause(300);
+        q.key("ret", &[])?;
+        // Power cut: no grace period.
+        q.quit()
+    })();
+    stop_qemu(&mut child);
+    r1?;
+    let printed = std::fs::read(out.join("printer.bin"))?;
+    let has = |needle: &[u8]| printed.windows(needle.len()).any(|w| w == needle);
+    if !has(b"Receipt #1") {
+        return Err("e2e: receipt #1 not captured on the printer port".into());
+    }
+    if !has(&[0x1B, 0x70, 0x00, 25, 250]) {
+        return Err("e2e: no cash-drawer kick on the printer port".into());
+    }
+    std::fs::copy(out.join("printer.bin"), out.join("printer_boot1.bin"))?;
+
+    // ---------------- boot 2
+    let mut child = qemu::spawn(&opts(false))?;
+    let r2 = (|| -> Res<()> {
+        let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
+        wait_ui(&mut q, &out, Duration::from_secs(90))?;
+        q.type_str("1\n", human)?;
+        q.type_str("1234\n", human)?;
+        pause(1500);
+        q.key("f10", &[])?;
+        pause(300);
+        q.type_str("7", human)?; // export
+        pause(4000);
+        q.screendump(&out.join("e2e_after_export.ppm"))?;
+        pause(300);
+        q.quit()
+    })();
+    stop_qemu(&mut child);
+    r2?;
+
+    // ---------------- host-side checks
+    let journal = (1..100_000u64)
+        .find_map(|seq| {
+            image::read_media_file(&media, &format!("J{seq:08}.CSV"))
+                .ok()
+                .flatten()
+        })
+        .ok_or("e2e: no journal CSV exported (see out/e2e_after_export.ppm)")?;
+    let text = String::from_utf8(journal)?;
+    let mut receipts = Vec::new();
+    let mut seqs = Vec::new();
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split(',').collect();
+        if cols.len() < 8 {
+            return Err(format!("e2e: malformed journal row {line}").into());
+        }
+        seqs.push(cols[0].parse::<u64>()?);
+        if cols[2].is_empty() || cols[1].len() != 64 {
+            return Err(format!("e2e: missing time/hash in {line}").into());
+        }
+        if cols[3] == "SALE" {
+            receipts.push(cols[4].parse::<u64>()?);
+        }
+    }
+    if seqs.windows(2).any(|w| w[1] != w[0] + 1) {
+        return Err(format!("e2e: journal sequence has gaps: {seqs:?}").into());
+    }
+    if receipts.first() != Some(&1) || receipts.windows(2).any(|w| w[1] != w[0] + 1) {
+        return Err(format!("e2e: receipt sequence wrong: {receipts:?}").into());
+    }
+    println!(
+        "e2e: OK - {} journal records, sales {:?} (sale 2 {} the power cut), receipt + drawer kick captured",
+        seqs.len(),
+        receipts,
+        if receipts.contains(&2) {
+            "committed before"
+        } else {
+            "lost to"
+        }
+    );
+    Ok(())
 }
