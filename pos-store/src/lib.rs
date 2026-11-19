@@ -624,6 +624,11 @@ impl<D: BlockDevice> Store<D> {
         &mut self.dev
     }
 
+    /// Give the device back (e.g. to reformat after a failed recovery).
+    pub fn into_device(self) -> D {
+        self.dev
+    }
+
     /// Oldest position that must not be overwritten.
     fn protect(&self) -> Pos {
         let mut p = self.sb.retain;

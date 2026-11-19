@@ -442,6 +442,9 @@ pub fn journal_row(seq: u64, hash_hex: &str, e: &Event, cfg: &Config) -> String 
             (String::new(), by.to_string(), String::new(), String::new())
         }
         Event::NoSale { by, .. } => (String::new(), by.to_string(), String::new(), String::new()),
+        Event::StoreAdopted { by, .. } => {
+            (String::new(), by.to_string(), String::new(), String::new())
+        }
         Event::Exported {
             by, what, bytes, ..
         } => (

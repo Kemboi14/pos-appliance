@@ -114,6 +114,12 @@ pub enum Event {
         what: String,
         bytes: u64,
     },
+    /// A manager adopted a store that was bound to another machine (or whose
+    /// binding failed to verify). Always journaled right after re-binding.
+    StoreAdopted {
+        by: UserId,
+        at: i64,
+    },
 }
 
 impl Event {
@@ -134,7 +140,8 @@ impl Event {
             | Event::Override { at, .. }
             | Event::NoSale { at, .. }
             | Event::Reprint { at, .. }
-            | Event::Exported { at, .. } => *at,
+            | Event::Exported { at, .. }
+            | Event::StoreAdopted { at, .. } => *at,
             Event::SaleCompleted(s) => s.at,
             Event::RefundCompleted(r) => r.at,
             Event::Report(r) => r.at,
@@ -164,6 +171,7 @@ impl Event {
             Event::Report(r) if r.kind == ReportKind::Z => "Z_REPORT",
             Event::Report(_) => "X_REPORT",
             Event::Exported { .. } => "EXPORT",
+            Event::StoreAdopted { .. } => "ADOPT",
         }
     }
 }
@@ -648,6 +656,9 @@ impl PosState {
             Event::Report(r) => self.apply_report(r)?,
             Event::Exported { by, .. } => {
                 self.require(*by, Permission::Export)?;
+            }
+            Event::StoreAdopted { by, .. } => {
+                self.require(*by, Permission::Configure)?;
             }
         }
         Ok(())
