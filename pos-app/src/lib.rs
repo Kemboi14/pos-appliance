@@ -20,6 +20,7 @@ pub mod receipt;
 mod screens;
 pub mod settings;
 pub mod stock;
+pub mod sync;
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -94,6 +95,11 @@ pub fn describe(e: &AppError) -> String {
             DomainError::RefundExceedsSale => "Refund exceeds what was sold".into(),
             DomainError::UnknownReceipt => "Unknown or expired receipt".into(),
             DomainError::Tender(t) => format!("Tender rejected: {t:?}"),
+            DomainError::ManagedByHead => {
+                "Managed by the head till (catalog, users, settings, pictures)".into()
+            }
+            DomainError::Sync(s) => format!("Store network: {s}"),
+            DomainError::Stock(s) => format!("Stock: {s}"),
             other => format!("{other:?}"),
         },
         AppError::Store(StoreError::Full) => {
@@ -134,6 +140,12 @@ pub fn kind_code(e: &Event) -> u16 {
         Event::StockWrittenOff { .. } => 23,
         Event::ReorderLevelSet { .. } => 24,
         Event::PictureSet { .. } => 25,
+        Event::NetConfigured { .. } => 26,
+        Event::SyncReceived { .. } => 27,
+        Event::SyncAcked { .. } => 28,
+        Event::SyncRelayed { .. } => 29,
+        Event::SyncResynced { .. } => 30,
+        Event::SyncSection { .. } => 31,
     }
 }
 
@@ -192,6 +204,9 @@ pub struct App<D: BlockDevice> {
     pub(crate) place: Place,
     pub(crate) stock: stock::StockList,
     pub(crate) gallery: pictures::Gallery,
+    pub(crate) net_rt: sync::SyncRuntime,
+    /// The signed-in user's record changed (from the head) during a sale.
+    pub(crate) stale_user: bool,
 }
 
 impl<D: BlockDevice> core::fmt::Debug for App<D> {
@@ -256,6 +271,8 @@ impl<D: BlockDevice> App<D> {
             place: Place::Home,
             stock: stock::StockList::default(),
             gallery: pictures::Gallery::default(),
+            net_rt: sync::SyncRuntime::default(),
+            stale_user: false,
         };
         let status = match Store::open(dev, &key) {
             Ok(rec) => {
@@ -472,6 +489,12 @@ impl<D: BlockDevice> App<D> {
                     }
                 }
             }
+        }
+        if self.stale_user && self.cart.is_empty() && !matches!(self.screen, Screen::Pay) {
+            self.stale_user = false;
+            self.user = None;
+            self.place = Place::Home;
+            self.screen = screens::login_screen(self);
         }
         if self.fatal {
             Control::Reset

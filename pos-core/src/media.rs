@@ -62,6 +62,9 @@ impl Pictures {
     pub fn item(&self, sku: &str) -> Option<&Arc<Picture>> {
         self.map.get(&PictureFor::Item(sku.into()))
     }
+    pub fn keys(&self) -> impl Iterator<Item = &PictureFor> {
+        self.map.keys()
+    }
     pub fn len(&self) -> usize {
         self.map.len()
     }

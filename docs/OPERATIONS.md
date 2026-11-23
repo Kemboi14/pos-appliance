@@ -82,6 +82,18 @@ Manager menu → "Import pictures from USB" reads these files from the root of a
 
 Characters a file name cannot hold (`/ \ : * ? " < > |`) are written `_` in `IMG_<SKU>`. Pictures are shrunk on import (products and users 128 px, logo 512×256, wallpaper 640×360), stored losslessly in the journal and survive reboots. Importing again replaces them. Picture storage is limited to about half a snapshot slot; the import says which files were skipped and why.
 
+## Store network (several tills)
+
+Tills are connected by **network cable** to the store's switch (see `docs/NETWORK.md` for why not Wi-Fi). One till is the **head**; the others are **lanes**.
+
+1. On the head: manager menu → "Network setup" → `2` Head → till number (e.g. 1) → IP address (empty = DHCP, or `192.168.1.10/24 gw 192.168.1.1`). The screen shows the **store network code**; with a USB stick inserted it is also written to `STORENET.KEY`. Keep it safe: it is the store's network password.
+2. On each lane: "Network setup" → `3` Lane → its own till number → type the code (or leave empty to read `STORENET.KEY` from the stick) → IP address → head's address (empty = find automatically).
+3. The lane then receives the head's catalog, prices, users (the head's PINs apply on every till), settings and pictures, and the store-wide stock. The lane's own first manager is replaced, so sign in with a head user.
+
+Every sale, refund, delivery, count and write-off on any till updates the stock on all tills within seconds. A till keeps selling when the cable or the head is down and catches up when it is back. The status bar shows `Till n · address · online`; the head's home screen shows tills online and the store's sales today; "Network status" in the manager menu shows details. On lanes, catalog/user/settings/picture changes are refused ("Managed by the head till") — make them on the head.
+
+Every till in one store must have a different number. If a till is lost or retired, set up the head again with a new key (choose Standalone, then Head) and re-join the lanes.
+
 ## CATALOG.CSV
 
 ```

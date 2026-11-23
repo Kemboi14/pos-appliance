@@ -551,9 +551,13 @@ pub(crate) fn view<D: pos_hal::BlockDevice>(app: &mut crate::App<D>, now: i64) -
             app.state.catalog.len()
         )
     } else if alerts > 0 {
-        format!("{alerts} products low or out of stock")
+        format!(
+            "{alerts} product{} low or out of stock",
+            if alerts == 1 { "" } else { "s" }
+        )
     } else {
-        format!("{} products in stock", inv.tracked())
+        let n = inv.tracked();
+        format!("{n} product{} in stock", if n == 1 { "" } else { "s" })
     };
     DeskView {
         wall,
@@ -571,6 +575,28 @@ pub(crate) fn view<D: pos_hal::BlockDevice>(app: &mut crate::App<D>, now: i64) -
         till_sub,
         stock_sub,
         stock_alert: alerts > 0,
-        net: String::new(),
+        net: net_line(app, now),
     }
+}
+
+fn net_line<D: pos_hal::BlockDevice>(app: &crate::App<D>, now: i64) -> String {
+    use pos_core::sync::NetRole;
+    let n = &app.state.net;
+    if !n.networked() {
+        return String::new();
+    }
+    let s = app.net_status();
+    let mut out = format!("Till {}", n.till);
+    if !s.is_empty() {
+        out.push_str(" · ");
+        out.push_str(s);
+    }
+    if n.role == NetRole::Head {
+        let (count, total, _) = app.state.sync.store_today(now);
+        out.push_str(&format!(
+            " · store today {count} sales {}",
+            app.money(total)
+        ));
+    }
+    out
 }

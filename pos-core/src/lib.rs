@@ -27,6 +27,7 @@ pub mod money;
 pub mod sale;
 pub mod shift;
 pub mod state;
+pub mod sync;
 pub mod tender;
 
 pub use money::{Money, Qty, Rate, Rounding};

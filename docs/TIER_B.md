@@ -17,6 +17,8 @@ checklist.
 | 6. ACPI reset | Done (2026-11-23) |
 | Boot chain: signed stage 0 → signed Limine (config enrolled) → hashed kernel | Done (2026-11-23) |
 | Store key handover (same NVRAM key as Tier A) | Done (2026-11-23) |
+| Store network: virtio-net, Intel e1000/e1000e (82540/82545/82574) | Done (2026-11-23), QEMU only |
+| Intel I217/I218/I219 (PCH LAN), Realtek | **Not supported yet** |
 | Real-hardware checklist (HARDENING.md) | **Not started** |
 
 QEMU evidence, all in `cargo xtask ci`:

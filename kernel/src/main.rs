@@ -4,8 +4,9 @@
 //! Bring-up: own GDT/IDT, heap, guarded stack, SMEP/SMAP, framebuffer,
 //! TSC/RTC clock, LAPIC timer, ACPI reset, xHCI with HID keyboard/pointer,
 //! mass storage (data partition on the boot stick, FAT export stick) and
-//! USB printer (COM2 serial fallback). `pos-app` runs unchanged on these HAL
-//! objects. Single CPU; device work happens in the main loop with
+//! USB printer (COM2 serial fallback), and — only when the till is
+//! configured into a store network — virtio-net / Intel e1000 Ethernet.
+//! `pos-app` runs unchanged on these HAL objects. Single CPU; device work happens in the main loop with
 //! interrupts off, and the CPU sleeps in `hlt` between 1 kHz timer ticks.
 #![no_std]
 #![no_main]
@@ -21,6 +22,7 @@ mod fb;
 mod heap;
 mod limine;
 mod mm;
+mod nic;
 mod pci;
 mod power;
 mod rng;
@@ -137,7 +139,21 @@ extern "C" fn kmain2() -> ! {
     }
 
     let mut next_tick = clock.monotonic_us();
+    let mut network: Option<pos_app::sync::Network<nic::KernelNic>> = None;
+    let mut nic_missing = false;
     loop {
+        if network.is_none() && !nic_missing && app.node_config().is_some() {
+            match nic::KernelNic::probe() {
+                Some(n) => {
+                    klog!("network: {} {:02x?}", n.describe(), pos_hal::Nic::mac(&n));
+                    network = Some(pos_app::sync::Network::new(n));
+                }
+                None => {
+                    nic_missing = true;
+                    app.notice("Network: no supported network adapter found", true);
+                }
+            }
+        }
         let mut hw = Hw {
             display: &mut disp,
             clock: &clock,
@@ -145,6 +161,9 @@ extern "C" fn kmain2() -> ! {
             rng: &mut entropy,
             media: &mut media,
         };
+        if let Some(n) = &mut network {
+            n.step(&mut app, &mut hw, clock.monotonic_us() / 1000);
+        }
         while let Some(ev) = input.poll() {
             if app.handle(ev, &mut hw) == Control::Reset {
                 app.render(&mut hw);

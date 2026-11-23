@@ -13,6 +13,7 @@ use pos_core::csv::parse_money;
 use pos_core::media::PictureFor;
 use pos_core::shift::ReportKind;
 use pos_core::state::Event;
+use pos_core::sync::{NetRole, NetSettings, StaticIp};
 use pos_core::tender::{Payment, Tender, TenderKind};
 use pos_core::{Money, Qty, Rate};
 use pos_hal::{BlockDevice, Key, Modifiers};
@@ -49,6 +50,7 @@ pub enum Pending {
     Stock(StockOp),
     ExportStock,
     ImportPictures,
+    NetworkSetup,
 }
 
 impl Pending {
@@ -70,6 +72,7 @@ impl Pending {
             Pending::Stock(_) => Permission::Stock,
             Pending::ExportStock => Permission::Export,
             Pending::ImportPictures => Permission::ManageCatalog,
+            Pending::NetworkSetup => Permission::Configure,
         }
     }
 }
@@ -107,6 +110,11 @@ pub enum Next {
     StockWriteOffQty(String),
     StockWriteOffReason(String, Qty),
     StockReorder(String),
+    NetRole,
+    NetTill(NetRole),
+    NetKey(NetSettings),
+    NetAddress(NetSettings),
+    NetHead(NetSettings),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,7 +157,10 @@ impl Next {
             | Next::RefundReason(..)
             | Next::RefundCardRef(..)
             | Next::AddUserName(_)
-            | Next::StockSearch => Input::Text,
+            | Next::StockSearch
+            | Next::NetKey(_)
+            | Next::NetAddress(_)
+            | Next::NetHead(_) => Input::Text,
             Next::Float
             | Next::VoucherAmount(_)
             | Next::ZCounted
@@ -172,6 +183,8 @@ impl Next {
             | Next::RefundReceipt
             | Next::RefundPayout(..)
             | Next::StockWriteOffReason(..)
+            | Next::NetRole
+            | Next::NetTill(_)
             | Next::UnlockUser => Input::Digits,
         }
     }
@@ -190,13 +203,21 @@ impl Next {
         )
     }
 
+    fn max_len(&self) -> usize {
+        match self {
+            Next::NetKey(_) => 80,
+            _ => 40,
+        }
+    }
+
     fn initial_shift(&self) -> Shift {
         match self {
             // Codes and the ERASE confirmation are upper case.
             Next::FormatConfirm
             | Next::CardRef(_)
             | Next::VoucherCode
-            | Next::RefundCardRef(..) => Shift::Lock,
+            | Next::RefundCardRef(..)
+            | Next::NetKey(_) => Shift::Lock,
             // Names and reasons start with a capital.
             Next::SetupName | Next::AddUserName(_) | Next::RefundReason(..) => Shift::Once,
             _ => Shift::Off,
@@ -281,6 +302,10 @@ pub(crate) fn initial_screen<D: BlockDevice>(app: &App<D>, st: &BootStatus) -> S
             Next::FormatConfirm,
         ),
     }
+}
+
+pub(crate) fn login_screen<D: BlockDevice>(app: &App<D>) -> Screen {
+    login_prompt(app)
 }
 
 fn login_prompt<D: BlockDevice>(app: &App<D>) -> Screen {
@@ -421,7 +446,7 @@ fn prompt_key<D: BlockDevice>(
     hw: &mut Hw<'_>,
 ) -> Screen {
     match key {
-        Key::Char(c) if p.field.chars().count() < 40 => {
+        Key::Char(c) if p.field.chars().count() < p.next.max_len() => {
             p.field.push(c);
             if c.is_alphabetic() && p.shift == Shift::Once {
                 p.shift = Shift::Off;
@@ -904,6 +929,108 @@ fn submit<D: BlockDevice>(app: &mut App<D>, p: Prompt, field: String, hw: &mut H
             }
             _ => again(p, app, "User number"),
         },
+        Next::NetRole => match field.trim() {
+            "1" => {
+                let ev = Event::NetConfigured {
+                    by: app.user.unwrap_or(0),
+                    at: now,
+                    settings: NetSettings::default(),
+                };
+                match app.commit(vec![ev]) {
+                    Ok(_) => app.set_msg("Network off: this till works alone", false),
+                    Err(e) => app.err(&e),
+                }
+                back_to_work(app)
+            }
+            "2" | "3" => {
+                let role = if field.trim() == "2" {
+                    NetRole::Head
+                } else {
+                    NetRole::Lane
+                };
+                prompt(
+                    "Network setup",
+                    "This till's number in the store (1-99, each till different)",
+                    false,
+                    Next::NetTill(role),
+                )
+            }
+            _ => again(p, app, "Choose 1, 2 or 3"),
+        },
+        Next::NetTill(role) => {
+            let Some(till) = field
+                .trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|t| (1..=99).contains(t))
+            else {
+                return again(p, app, "Till number 1-99");
+            };
+            let mut s = NetSettings {
+                role,
+                till,
+                ..NetSettings::default()
+            };
+            if role == NetRole::Head {
+                // Keep the store's key when re-configuring the head.
+                s.key = match (app.state.net.role, app.state.net.key) {
+                    (NetRole::Head, Some(k)) => Some(k),
+                    _ => random::<32>(hw),
+                };
+                if s.key.is_none() {
+                    return Screen::Fatal("No entropy source".into());
+                }
+                return prompt("Network setup", ADDRESS_HINT, false, Next::NetAddress(s));
+            }
+            prompt(
+                "Network setup",
+                "Store network code from the head till, or leave empty to read \
+                 STORENET.KEY from the USB stick",
+                false,
+                Next::NetKey(s),
+            )
+        }
+        Next::NetKey(mut s) => {
+            let code = if field.trim().is_empty() {
+                match hw.media.read_file("STORENET.KEY", 1024) {
+                    Ok(d) => String::from_utf8_lossy(&d).into_owned(),
+                    Err(e) => return again(p, app, &format!("STORENET.KEY: {e}")),
+                }
+            } else {
+                field.clone()
+            };
+            let Some(k) = pos_net::StoreKey::from_code(code.trim()) else {
+                return again(p, app, "Not a valid store network code");
+            };
+            s.key = Some(k.0);
+            prompt("Network setup", ADDRESS_HINT, false, Next::NetAddress(s))
+        }
+        Next::NetAddress(mut s) => {
+            match parse_address(&field) {
+                Some(a) => s.static_ip = a,
+                None => return again(p, app, "Like 192.168.1.20/24 gw 192.168.1.1, or empty"),
+            }
+            if s.role == NetRole::Lane {
+                return prompt(
+                    "Network setup",
+                    "Head till's IP address, or leave empty to find it automatically",
+                    false,
+                    Next::NetHead(s),
+                );
+            }
+            finish_network(app, s, now, hw)
+        }
+        Next::NetHead(mut s) => {
+            if field.trim().is_empty() {
+                s.head_ip = None;
+            } else {
+                match parse_ip(field.trim()) {
+                    Some(ip) => s.head_ip = Some(ip),
+                    None => return again(p, app, "Like 192.168.1.10, or empty"),
+                }
+            }
+            finish_network(app, s, now, hw)
+        }
         Next::StockSearch => {
             app.stock.query = field.trim().into();
             app.stock.sel = 0;
@@ -961,6 +1088,159 @@ fn submit<D: BlockDevice>(app: &mut App<D>, p: Prompt, field: String, hw: &mut H
             Some(level) => authorize(app, Pending::Stock(StockOp::Reorder { sku, level }), hw),
             None => again(p, app, "Enter a quantity (0 for none)"),
         },
+    }
+}
+
+const ADDRESS_HINT: &str = "IP address: leave empty for automatic (DHCP), or type e.g. \
+     192.168.1.20/24 gw 192.168.1.1";
+
+fn parse_ip(s: &str) -> Option<[u8; 4]> {
+    let v: Vec<u8> = s
+        .split('.')
+        .map(|x| x.parse().ok())
+        .collect::<Option<_>>()?;
+    v.try_into().ok()
+}
+
+/// "" → DHCP; "a.b.c.d/nn [gw e.f.g.h]" → static.
+fn parse_address(s: &str) -> Option<Option<StaticIp>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(None);
+    }
+    let mut parts = s.split_whitespace();
+    let (ip, prefix) = parts.next()?.split_once('/')?;
+    let ip = parse_ip(ip)?;
+    let prefix: u8 = prefix.parse().ok().filter(|p| (8..=30).contains(p))?;
+    let gateway = match (parts.next(), parts.next()) {
+        (None, _) => None,
+        (Some(g), Some(addr)) if g.eq_ignore_ascii_case("gw") => Some(parse_ip(addr)?),
+        _ => return None,
+    };
+    Some(Some(StaticIp {
+        ip,
+        prefix,
+        gateway,
+    }))
+}
+
+fn finish_network<D: BlockDevice>(
+    app: &mut App<D>,
+    s: NetSettings,
+    now: i64,
+    hw: &mut Hw<'_>,
+) -> Screen {
+    let Some(by) = app.user else {
+        return login_prompt(app);
+    };
+    let key = s.key.map(pos_net::StoreKey);
+    let role = s.role;
+    if let Err(e) = app.commit(vec![Event::NetConfigured {
+        by,
+        at: now,
+        settings: s.clone(),
+    }]) {
+        app.err(&e);
+        return back_to_work(app);
+    }
+    let Some(key) = key else {
+        return back_to_work(app);
+    };
+    let fp = receipt::hex(&key.fingerprint());
+    let mut lines = vec![
+        format!("This till: {} number {}", role.label(), s.till),
+        format!(
+            "Address: {}",
+            s.static_ip
+                .map(|a| format!(
+                    "{}.{}.{}.{}/{}",
+                    a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.prefix
+                ))
+                .unwrap_or_else(|| "automatic (DHCP)".into())
+        ),
+        format!("Store key fingerprint: {fp} (the same on every till)"),
+    ];
+    if role == NetRole::Head {
+        let code = key.to_code();
+        let written = hw.media.is_present()
+            && hw
+                .media
+                .write_file("STORENET.KEY", format!("{code}\r\n").as_bytes())
+                .is_ok();
+        lines.push(String::new());
+        lines.push("Store network code (type it on each lane, or use the stick):".into());
+        lines.push(code);
+        lines.push(if written {
+            "STORENET.KEY written to the USB stick - keep it safe".into()
+        } else {
+            "No USB stick: write the code down and keep it safe".into()
+        });
+    } else {
+        lines.push("Catalog, users, settings and pictures now come from the head till.".into());
+    }
+    Screen::Info {
+        title: "Store network".into(),
+        lines,
+    }
+}
+
+fn network_info<D: BlockDevice>(app: &App<D>) -> Screen {
+    let n = &app.state.net;
+    let s = &app.state.sync;
+    let mut lines = vec![format!(
+        "Role: {}   Till number: {}",
+        n.role.label(),
+        n.till
+    )];
+    if n.networked() {
+        let st = app.net_status();
+        lines.push(if st.is_empty() {
+            "Network: starting".into()
+        } else {
+            format!("Network: {st}")
+        });
+        if let Some(k) = n.key {
+            lines.push(format!(
+                "Store key fingerprint: {}",
+                receipt::hex(&pos_net::StoreKey(k).fingerprint())
+            ));
+        }
+    }
+    match n.role {
+        NetRole::Head => {
+            let now = app.state.last_event_at;
+            let (count, total, tills) = s.store_today(now);
+            lines.push(format!(
+                "Store today: {count} sales, {} {} on {tills} tills",
+                app.state.config.currency,
+                app.money(total)
+            ));
+            for (t, d) in &s.tills {
+                lines.push(format!(
+                    "  Till {t}: {} sales, {} (last {})",
+                    d.sales,
+                    app.money(d.total),
+                    receipt::fmt_time(d.last_at)
+                ));
+            }
+            lines.push(format!("Movements relayed: {}", s.relay_seq));
+        }
+        NetRole::Lane => {
+            lines.push(format!(
+                "Waiting to send: {} movements   Head confirmed up to {}",
+                s.outbox.len(),
+                s.acked
+            ));
+            lines.push(format!("Received from other tills up to {}", s.cursor));
+        }
+        NetRole::Standalone => lines.push("Not part of a store network".into()),
+    }
+    if let Some(e) = &app.net_rt.last_error {
+        lines.push(format!("Last problem: {e}"));
+    }
+    Screen::Info {
+        title: "Network status".into(),
+        lines,
     }
 }
 
@@ -1281,6 +1561,21 @@ fn execute<D: BlockDevice>(
                 Err(e) => app.set_msg(format!("STOCK.CSV: {e}"), true),
             }
             back_to_work(app)
+        }
+        Pending::NetworkSetup => {
+            if !events.is_empty()
+                && let Err(e) = app.commit(events)
+            {
+                app.err(&e);
+                return back_to_work(app);
+            }
+            prompt(
+                "Network setup",
+                "1 Standalone (no network) · 2 Head till (holds the catalog, users and \
+                 store-wide stock) · 3 Lane till (takes them from the head)",
+                false,
+                Next::NetRole,
+            )
         }
         Pending::ImportPictures => {
             match crate::pictures::import(app, hw, by, now, events) {
@@ -1719,6 +2014,8 @@ const MENU: &[&str] = &[
     "Journal status",
     "Import pictures from USB (IMG_<SKU>.JPG, LOGO, WALLPAPER)",
     "Export stock list (STOCK.CSV)",
+    "Network setup (head / lane till)",
+    "Network status",
     "Back",
 ];
 
@@ -1809,6 +2106,8 @@ fn menu_select<D: BlockDevice>(app: &mut App<D>, i: usize, hw: &mut Hw<'_>) -> S
         }
         13 => authorize(app, Pending::ImportPictures, hw),
         14 => authorize(app, Pending::ExportStock, hw),
+        15 => authorize(app, Pending::NetworkSetup, hw),
+        16 => network_info(app),
         _ => back_to_work(app),
     }
 }
@@ -2195,6 +2494,11 @@ fn prompt_choices<D: BlockDevice>(app: &App<D>, next: &Next, now: i64) -> Vec<(S
         Next::AdoptUser => users(&|u| u.role == Role::Manager),
         Next::OverrideUser(p) => users(&|u| app.state.allows(u.id, p.permission())),
         Next::UnlockUser => users(&|u| app.state.is_locked(u.id, now)),
+        Next::NetRole => vec![
+            ("Standalone".into(), "1".into()),
+            ("Head till".into(), "2".into()),
+            ("Lane till".into(), "3".into()),
+        ],
         Next::RefundPayout(..) => vec![
             ("Cash".into(), "1".into()),
             ("Back to card".into(), "2".into()),
@@ -2950,14 +3254,25 @@ fn status_line<D: BlockDevice>(app: &App<D>, now: i64) -> String {
     let pct = used * 100 / total.max(1);
     let printer = if app.printer_ok { "" } else { "   PRINTER!" };
     let full = if pct >= 80 { "   EXPORT NEEDED" } else { "" };
+    let net = if app.state.net.networked() {
+        let s = app.net_status();
+        if s.is_empty() {
+            format!("   •   Till {}", app.state.net.till)
+        } else {
+            format!("   •   Till {} · {s}", app.state.net.till)
+        }
+    } else {
+        String::new()
+    };
     format!(
-        "{}   •   {}   •   {}   •   {}   •   Journal {}%{}{}",
+        "{}   •   {}   •   {}   •   {}   •   Journal {}%{}{}{}",
         app.state.config.store_name,
         user,
         shift,
         receipt::fmt_time(now),
         pct,
         full,
-        printer
+        printer,
+        net
     )
 }

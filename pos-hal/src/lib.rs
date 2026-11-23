@@ -333,6 +333,37 @@ pub trait Power {
     fn shutdown(&mut self) -> !;
 }
 
+// ---------------------------------------------------------------- network
+
+/// An Ethernet interface: whole frames in and out (no FCS), never blocking.
+pub trait Nic {
+    fn mac(&self) -> [u8; 6];
+    fn link_up(&mut self) -> bool;
+    /// Queue one frame (14-byte header + payload, ≤ 1514 bytes).
+    fn transmit(&mut self, frame: &[u8]) -> HalResult<()>;
+    /// Copy the next received frame into `buf` and return its length.
+    fn receive(&mut self, buf: &mut [u8]) -> Option<usize>;
+}
+
+/// No network hardware (or networking off).
+#[derive(Debug, Default)]
+pub struct NoNic;
+
+impl Nic for NoNic {
+    fn mac(&self) -> [u8; 6] {
+        [0x02, 0, 0, 0, 0, 0]
+    }
+    fn link_up(&mut self) -> bool {
+        false
+    }
+    fn transmit(&mut self, _: &[u8]) -> HalResult<()> {
+        Err(HalError::NotFound)
+    }
+    fn receive(&mut self, _: &mut [u8]) -> Option<usize> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

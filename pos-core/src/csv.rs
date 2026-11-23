@@ -518,6 +518,64 @@ pub fn journal_row(seq: u64, hash_hex: &str, e: &Event, cfg: &Config) -> String 
                     .unwrap_or_else(|| "removed".into())
             ),
         ),
+        Event::NetConfigured { by, settings, .. } => (
+            String::new(),
+            by.to_string(),
+            String::new(),
+            // Never the key itself.
+            alloc::format!(
+                "role={} till={} key={}",
+                settings.role.label(),
+                settings.till,
+                if settings.key.is_some() {
+                    "set"
+                } else {
+                    "none"
+                }
+            ),
+        ),
+        Event::SyncReceived { from, items, .. } => (
+            String::new(),
+            String::new(),
+            String::new(),
+            alloc::format!(
+                "from={from} movements={} last={}",
+                items.len(),
+                items.last().map_or(0, |m| m.seq)
+            ),
+        ),
+        Event::SyncAcked { upto, .. } => (
+            String::new(),
+            String::new(),
+            String::new(),
+            alloc::format!("upto={upto}"),
+        ),
+        Event::SyncRelayed { items, .. } => (
+            String::new(),
+            String::new(),
+            String::new(),
+            alloc::format!(
+                "movements={} upto={}",
+                items.len(),
+                items.last().map_or(0, |m| m.0)
+            ),
+        ),
+        Event::SyncResynced {
+            relay_seq, levels, ..
+        } => (
+            String::new(),
+            String::new(),
+            String::new(),
+            alloc::format!("levels={} upto={relay_seq}", levels.len()),
+        ),
+        Event::SyncSection {
+            version, section, ..
+        } => (
+            String::new(),
+            String::new(),
+            String::new(),
+            alloc::format!("{:?} v{version}", section.key()),
+        ),
     };
     alloc::format!(
         "{},{},{},{},{},{},{},{}\r\n",

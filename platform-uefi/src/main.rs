@@ -2,10 +2,12 @@
 //!
 //! * Never calls `ExitBootServices`; every device is driven through firmware
 //!   protocols.
-//! * Opens no network protocol (SNP/MNP/IP4/TCP); see docs/HARDENING.md for
-//!   disabling the firmware network stack and PXE.
+//! * Opens no network protocol unless the till is configured into a store
+//!   network; then it takes the Simple Network Protocol exclusively (the
+//!   firmware's MNP/IP/PXE stack is disconnected) and runs its own
+//!   encrypted store link (docs/NETWORK.md, docs/HARDENING.md).
 //! * Single-threaded: blocks in `WaitForEvent` on keyboard, pointer and a
-//!   periodic timer; no busy loops.
+//!   periodic timer (20 ms while networked, 1 s otherwise); no busy loops.
 #![no_std]
 #![no_main]
 
@@ -17,6 +19,7 @@ mod display;
 mod input;
 mod keyvar;
 mod media;
+mod net;
 mod printer;
 mod rng;
 
@@ -123,9 +126,33 @@ fn main() -> Status {
         app.render(&mut hw);
     }
 
+    let mut network: Option<pos_app::sync::Network<net::UefiNic>> = None;
+    let mut nic_missing = false;
+    let mut fast = false;
+    let mut last_tick_us = clock_now(&clock);
     loop {
         let which = boot::wait_for_event(&events).unwrap_or(tick_index);
         input.pump(&clock);
+        // Networked: wake every 20 ms to run the stack.
+        let want_fast = app.node_config().is_some();
+        if want_fast != fast {
+            fast = want_fast;
+            let period = if fast {
+                Duration::from_millis(20)
+            } else {
+                Duration::from_secs(1)
+            };
+            let _ = boot::set_timer(&events[tick_index], TimerTrigger::Periodic(period));
+        }
+        if fast && network.is_none() && !nic_missing {
+            match net::UefiNic::init() {
+                Some(n) => network = Some(pos_app::sync::Network::new(n)),
+                None => {
+                    nic_missing = true;
+                    app.notice("Network: no usable network adapter found", true);
+                }
+            }
+        }
         let mut hw = Hw {
             display: &mut disp,
             clock: &clock,
@@ -133,6 +160,9 @@ fn main() -> Status {
             rng: &mut entropy,
             media: &mut media,
         };
+        if let Some(n) = &mut network {
+            n.step(&mut app, &mut hw, clock_now(&clock) / 1000);
+        }
         while let Some(ev) = pos_hal::Input::poll(&mut input) {
             if app.handle(ev, &mut hw) == Control::Reset {
                 app.render(&mut hw);
@@ -140,11 +170,17 @@ fn main() -> Status {
                 runtime::reset(ResetType::COLD, Status::DEVICE_ERROR, None);
             }
         }
-        if which == tick_index {
+        let now = clock_now(&clock);
+        if which == tick_index && now.saturating_sub(last_tick_us) >= 1_000_000 {
+            last_tick_us = now;
             app.tick(&mut hw);
         }
         app.render(&mut hw);
     }
+}
+
+fn clock_now(c: &clock::TscClock) -> u64 {
+    pos_hal::Clock::monotonic_us(c)
 }
 
 /// Show a platform error full-screen and wait for a key, then reset.

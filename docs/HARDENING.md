@@ -5,7 +5,7 @@
 1. **Secure Boot: custom mode.** Clear factory keys, enroll our PK/KEK/db (below). Do not enroll the Microsoft CAs unless the hardware needs signed option ROMs (discrete GPU/NIC); if it does, add only "Microsoft UEFI CA" to db and accept that anything Microsoft-signed (e.g. shim) can then boot.
 2. **Firmware administrator password** set and recorded in the shop's safe. Without it, anyone can disable Secure Boot or boot another OS and read the store-binding NVRAM variable.
 3. **Boot order**: USB stick only; disable "boot from other devices", one-time boot menus (F12/F11) if the firmware allows, and PXE.
-4. **Network**: disable the UEFI network stack (often "Network Stack", "IPv4/IPv6 PXE Support"), Wake-on-LAN, and the onboard NIC if possible. The app never opens SNP/MNP/IP4/TCP; disabling the stack removes the firmware's own attack surface too. Wi-Fi/Bluetooth off.
+4. **Network**: disable PXE ("IPv4/IPv6 PXE Support") and Wake-on-LAN; Wi-Fi/Bluetooth off. *Standalone tills*: also disable the UEFI network stack and the onboard NIC — the app never opens the network. *Store-network tills* (docs/NETWORK.md): keep the onboard NIC enabled (Tier A needs the firmware's network driver, "Network Stack" may stay off — the app uses SNP directly and disconnects the firmware's IP stack). Put tills on their own VLAN/switch ports, with no route to the internet.
 5. **Serial console redirection: off.** Otherwise firmware text is sent to a serial receipt printer at power-on (observed in QEMU: OVMF writes its console to every serial port).
 6. **CSM/Legacy boot: off.**
 7. **RTC set to UTC.** The journal records UTC; local time display is a future setting.

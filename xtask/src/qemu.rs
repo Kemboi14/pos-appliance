@@ -24,6 +24,9 @@ pub struct QemuOpts {
     /// Define the media drive but leave it unplugged; plug it later with
     /// [`Qmp::plug_media`].
     pub media_unplugged: bool,
+    /// An Ethernet card on this QEMU netdev (e.g. a socket "cable" to
+    /// another VM): (netdev options, MAC address, device model).
+    pub nic: Option<(String, String, &'static str)>,
 }
 
 fn env_path(var: &str) -> Res<PathBuf> {
@@ -73,8 +76,17 @@ pub fn spawn(o: &QemuOpts) -> Res<Child> {
         "if=pflash,format=raw,unit=1,file={}",
         vars.display()
     ));
-    // No network devices at all: the appliance is offline by design.
-    cmd.args(["-nic", "none"]);
+    match &o.nic {
+        // The store-network tests: one card, no option ROM (no PXE).
+        Some((netdev, mac, model)) => {
+            cmd.args(["-netdev", &format!("{netdev},id=n0")]);
+            cmd.args(["-device", &format!("{model},netdev=n0,mac={mac},romfile=")]);
+        }
+        // Otherwise no network device at all.
+        None => {
+            cmd.args(["-nic", "none"]);
+        }
+    }
     // Enough root ports for every device, so QEMU does not insert a hub.
     cmd.args(["-device", "qemu-xhci,id=xhci,p2=8,p3=8"]);
     let at = |n: u8| {

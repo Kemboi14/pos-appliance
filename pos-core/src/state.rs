@@ -18,6 +18,10 @@ use crate::media::{Picture, PictureFor, Pictures};
 use crate::money::{Money, MoneyError, Qty};
 use crate::sale::{Refund, RefundLine, Refundable, RefundableLine, Sale, SoldLine};
 use crate::shift::{Counters, Report, ReportKind, Shift};
+use crate::sync::{
+    Levels, Movement, NetRole, NetSettings, SaleNote, Section, SectionKey, StockMove, SyncState,
+    TillNo,
+};
 use crate::tender::{Payment, Tender, TenderKind};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -158,6 +162,41 @@ pub enum Event {
         target: PictureFor,
         picture: Option<Picture>,
     },
+    /// Join or leave a store network, or change its settings.
+    NetConfigured {
+        by: UserId,
+        at: i64,
+        settings: NetSettings,
+    },
+    /// Head: movements received from a lane.
+    SyncReceived {
+        at: i64,
+        from: TillNo,
+        items: Vec<Movement>,
+    },
+    /// Lane: the head confirmed own movements up to `upto`.
+    SyncAcked {
+        at: i64,
+        upto: u64,
+    },
+    /// Lane: movements from other tills, by head relay number.
+    SyncRelayed {
+        at: i64,
+        items: Vec<(u64, Movement)>,
+    },
+    /// Lane: absolute stock from the head after falling out of its window.
+    SyncResynced {
+        at: i64,
+        relay_seq: u64,
+        acked: u64,
+        levels: Levels,
+    },
+    /// Lane: catalog, users, settings or a picture from the head.
+    SyncSection {
+        at: i64,
+        version: u64,
+        section: Section,
+    },
 }
 
 impl Event {
@@ -184,7 +223,13 @@ impl Event {
             | Event::StockCounted { at, .. }
             | Event::StockWrittenOff { at, .. }
             | Event::ReorderLevelSet { at, .. }
-            | Event::PictureSet { at, .. } => *at,
+            | Event::PictureSet { at, .. }
+            | Event::NetConfigured { at, .. }
+            | Event::SyncReceived { at, .. }
+            | Event::SyncAcked { at, .. }
+            | Event::SyncRelayed { at, .. }
+            | Event::SyncResynced { at, .. }
+            | Event::SyncSection { at, .. } => *at,
             Event::SaleCompleted(s) => s.at,
             Event::RefundCompleted(r) => r.at,
             Event::Report(r) => r.at,
@@ -220,6 +265,12 @@ impl Event {
             Event::StockWrittenOff { .. } => "STOCK_OUT",
             Event::ReorderLevelSet { .. } => "REORDER",
             Event::PictureSet { .. } => "PICTURE",
+            Event::NetConfigured { .. } => "NETWORK",
+            Event::SyncReceived { .. } => "SYNC_IN",
+            Event::SyncAcked { .. } => "SYNC_ACK",
+            Event::SyncRelayed { .. } => "SYNC_RELAY",
+            Event::SyncResynced { .. } => "SYNC_RESYNC",
+            Event::SyncSection { .. } => "SYNC_SECTION",
         }
     }
 }
@@ -240,8 +291,14 @@ pub enum DomainError {
     NoShift,
     ShiftAlreadyOpen,
     ShiftMismatch,
-    ReceiptSequence { expected: u64, got: u64 },
-    ZSequence { expected: u32, got: u32 },
+    ReceiptSequence {
+        expected: u64,
+        got: u64,
+    },
+    ZSequence {
+        expected: u32,
+        got: u32,
+    },
     InconsistentTotals,
     NotPaid,
     UnknownReceipt,
@@ -250,6 +307,9 @@ pub enum DomainError {
     SetupDone,
     LastManager,
     Stock(&'static str),
+    /// Lanes take catalog, users, settings and pictures from the head.
+    ManagedByHead,
+    Sync(&'static str),
 }
 
 impl From<MoneyError> for DomainError {
@@ -293,6 +353,27 @@ pub struct PosState {
     pub last_event_at: i64,
     pub inventory: Inventory,
     pub pictures: Pictures,
+    pub net: NetSettings,
+    pub sync: SyncState,
+}
+
+/// Snapshot layout of M8 (before the store network).
+#[derive(Deserialize)]
+struct PosStateV2 {
+    config: Config,
+    catalog: Catalog,
+    users: BTreeMap<UserId, User>,
+    locks: BTreeMap<UserId, LockState>,
+    shift: Option<Shift>,
+    next_receipt: u64,
+    next_z: u32,
+    next_shift: u32,
+    grand_total: Money,
+    refundable: BTreeMap<u64, Refundable>,
+    events: u64,
+    last_event_at: i64,
+    inventory: Inventory,
+    pictures: Pictures,
 }
 
 /// Snapshot layout before inventory and pictures (decoded for upgrade).
@@ -318,6 +399,26 @@ impl PosState {
         if let Ok(s) = postcard::from_bytes::<PosState>(b) {
             return Some(s);
         }
+        if let Ok(v) = postcard::from_bytes::<PosStateV2>(b) {
+            return Some(PosState {
+                config: v.config,
+                catalog: v.catalog,
+                users: v.users,
+                locks: v.locks,
+                shift: v.shift,
+                next_receipt: v.next_receipt,
+                next_z: v.next_z,
+                next_shift: v.next_shift,
+                grand_total: v.grand_total,
+                refundable: v.refundable,
+                events: v.events,
+                last_event_at: v.last_event_at,
+                inventory: v.inventory,
+                pictures: v.pictures,
+                net: NetSettings::default(),
+                sync: SyncState::default(),
+            });
+        }
         let v: PosStateV1 = postcard::from_bytes(b).ok()?;
         Some(PosState {
             config: v.config,
@@ -334,6 +435,8 @@ impl PosState {
             last_event_at: v.last_event_at,
             inventory: Inventory::default(),
             pictures: Pictures::default(),
+            net: NetSettings::default(),
+            sync: SyncState::default(),
         })
     }
 }
@@ -355,6 +458,8 @@ impl Default for PosState {
             last_event_at: 0,
             inventory: Inventory::default(),
             pictures: Pictures::default(),
+            net: NetSettings::default(),
+            sync: SyncState::default(),
         }
     }
 }
@@ -592,10 +697,175 @@ impl PosState {
     /// violates an invariant.
     pub fn apply(&mut self, e: &Event) -> DResult<()> {
         let mut next = self.clone_for(e);
+        next.managed_check(e)?;
         next.apply_inner(e)?;
         next.events += 1;
         next.last_event_at = next.last_event_at.max(e.at());
+        next.after_sync(e);
         *self = next;
+        Ok(())
+    }
+
+    fn managed_check(&self, e: &Event) -> DResult<()> {
+        if self.net.role != NetRole::Lane {
+            return Ok(());
+        }
+        match e {
+            Event::CatalogUpsert { .. }
+            | Event::CatalogDelete { .. }
+            | Event::CatalogReplace { .. }
+            | Event::ConfigSet { .. }
+            | Event::PictureSet { .. }
+            | Event::UserSet { by: Some(_), .. } => Err(DomainError::ManagedByHead),
+            _ => Ok(()),
+        }
+    }
+
+    /// Share own stock movements and bump the head's section versions.
+    fn after_sync(&mut self, e: &Event) {
+        let role = self.net.role;
+        if role == NetRole::Head {
+            let v = self.events;
+            let key = match e {
+                Event::CatalogUpsert { .. }
+                | Event::CatalogDelete { .. }
+                | Event::CatalogReplace { .. } => Some(SectionKey::Catalog),
+                Event::UserSet { .. } => Some(SectionKey::Users),
+                Event::ConfigSet { .. } => Some(SectionKey::Config),
+                Event::PictureSet { target, .. } => Some(SectionKey::Picture(target.clone())),
+                _ => None,
+            };
+            if let Some(k) = key {
+                self.sync.versions.insert(k, v);
+            }
+            if let Event::CatalogDelete { sku, .. } = e {
+                // A removed product's picture goes too.
+                self.sync
+                    .versions
+                    .insert(SectionKey::Picture(PictureFor::Item(sku.clone())), v);
+            }
+        }
+        if !self.net.networked() {
+            return;
+        }
+        let out = |sku: &str, delta: i64, track: bool| StockMove {
+            sku: sku.into(),
+            delta,
+            track,
+        };
+        let (at, moves, sale) = match e {
+            Event::SaleCompleted(s) => (
+                s.at,
+                s.lines
+                    .iter()
+                    .map(|l| out(&l.line.sku, -l.line.qty.0, false))
+                    .collect(),
+                Some(SaleNote {
+                    receipt: s.receipt_no,
+                    total: s.totals.total,
+                }),
+            ),
+            Event::RefundCompleted(r) => (
+                r.at,
+                r.lines
+                    .iter()
+                    .map(|l| out(&l.sku, l.qty.0, false))
+                    .collect(),
+                Some(SaleNote {
+                    receipt: r.receipt_no,
+                    total: Money(-r.total.0),
+                }),
+            ),
+            Event::StockReceived { at, lines, .. } => (
+                *at,
+                lines.iter().map(|l| out(&l.sku, l.qty.0, true)).collect(),
+                None,
+            ),
+            Event::StockCounted {
+                at, sku, variance, ..
+            } => (*at, alloc::vec![out(sku, variance.0, true)], None),
+            Event::StockWrittenOff { at, sku, qty, .. } => {
+                (*at, alloc::vec![out(sku, -qty.0, true)], None)
+            }
+            _ => return,
+        };
+        self.sync.next_seq += 1;
+        let m = Movement {
+            origin: self.net.till,
+            seq: self.sync.next_seq,
+            at,
+            moves,
+            sale,
+        };
+        match role {
+            NetRole::Lane => self.sync.outbox.push_back(m),
+            NetRole::Head => {
+                if let Some(n) = &m.sale {
+                    self.sync.note_sale(m.origin, m.at, n);
+                }
+                self.sync.origins.insert(m.origin, m.seq);
+                self.sync.push_relay(m);
+            }
+            NetRole::Standalone => {}
+        }
+    }
+
+    fn require_role(&self, r: NetRole) -> DResult<()> {
+        if self.net.role == r && self.net.networked() {
+            Ok(())
+        } else {
+            Err(DomainError::Sync("wrong network role"))
+        }
+    }
+
+    /// Mark every current section changed (a till becoming the head).
+    fn bump_all_sections(&mut self) {
+        let v = self.events + 1;
+        let s = &mut self.sync.versions;
+        s.insert(SectionKey::Config, v);
+        s.insert(SectionKey::Users, v);
+        s.insert(SectionKey::Catalog, v);
+        for k in self.pictures.keys() {
+            s.insert(SectionKey::Picture(k.clone()), v);
+        }
+    }
+
+    fn apply_section(&mut self, section: &Section) -> DResult<()> {
+        match section {
+            Section::Config(c) => {
+                c.validate().map_err(DomainError::Config)?;
+                self.config = c.clone();
+            }
+            Section::Users(users) => {
+                if !users.iter().any(|u| u.role == Role::Manager && u.active) {
+                    return Err(DomainError::LastManager);
+                }
+                self.users = users.iter().map(|u| (u.id, u.clone())).collect();
+                let ids = &self.users;
+                self.locks.retain(|k, _| ids.contains_key(k));
+            }
+            Section::Catalog(items) => {
+                self.catalog = Catalog::from_items(items, &self.config)
+                    .map_err(|(_, e)| DomainError::Catalog(e))?;
+                let gone: Vec<String> = self
+                    .inventory
+                    .levels()
+                    .map(|(s, _)| s.clone())
+                    .filter(|s| self.catalog.get(s).is_none())
+                    .collect();
+                for s in &gone {
+                    self.inventory.forget(s);
+                }
+                let cat = &self.catalog;
+                self.pictures.retain_items(|s| cat.get(s).is_some());
+            }
+            Section::Picture(k, p) => {
+                if p.as_ref().is_some_and(|p| !Pictures::valid(k, p)) {
+                    return Err(DomainError::Sync("bad picture"));
+                }
+                self.pictures.set(k.clone(), p.clone());
+            }
+        }
         Ok(())
     }
 
@@ -816,6 +1086,119 @@ impl PosState {
                 }
                 self.inventory.set_reorder(sku, *level);
             }
+            Event::NetConfigured { by, settings, .. } => {
+                self.require(*by, Permission::Configure)?;
+                if !settings.valid() {
+                    return Err(DomainError::Sync("network settings incomplete"));
+                }
+                let changed = settings.role != self.net.role
+                    || settings.key != self.net.key
+                    || settings.till != self.net.till;
+                if changed {
+                    // A new store or role starts a new sync history; own
+                    // movement numbers keep counting up.
+                    let next = self.sync.next_seq;
+                    self.sync = SyncState {
+                        next_seq: next,
+                        ..SyncState::default()
+                    };
+                }
+                self.net = settings.clone();
+                if changed && settings.role == NetRole::Head && settings.networked() {
+                    self.bump_all_sections();
+                    // Relay number 1 is the baseline: a lane that has seen
+                    // nothing (cursor 0) first gets absolute stock levels.
+                    self.sync.relay_seq = 1;
+                }
+            }
+            Event::SyncReceived { at, from, items } => {
+                self.require_role(NetRole::Head)?;
+                let _ = at;
+                for m in items {
+                    if m.origin != *from || *from == self.net.till {
+                        return Err(DomainError::Sync("movement from wrong till"));
+                    }
+                    let have = self.sync.origins.get(from).copied().unwrap_or(0);
+                    if m.seq <= have {
+                        continue;
+                    }
+                    if m.seq != have + 1 {
+                        return Err(DomainError::Sync("movement gap"));
+                    }
+                    for mv in &m.moves {
+                        self.inventory.apply_move(mv);
+                    }
+                    if let Some(n) = &m.sale {
+                        self.sync.note_sale(m.origin, m.at, n);
+                    }
+                    self.sync.origins.insert(*from, m.seq);
+                    self.sync.push_relay(m.clone());
+                }
+            }
+            Event::SyncAcked { upto, .. } => {
+                self.require_role(NetRole::Lane)?;
+                if *upto > self.sync.next_seq {
+                    return Err(DomainError::Sync("ack beyond what was sent"));
+                }
+                self.sync.acked = self.sync.acked.max(*upto);
+                let a = self.sync.acked;
+                while self.sync.outbox.front().is_some_and(|m| m.seq <= a) {
+                    self.sync.outbox.pop_front();
+                }
+            }
+            Event::SyncRelayed { items, .. } => {
+                self.require_role(NetRole::Lane)?;
+                for (hs, m) in items {
+                    if *hs <= self.sync.cursor {
+                        continue;
+                    }
+                    if m.origin != self.net.till {
+                        for mv in &m.moves {
+                            self.inventory.apply_move(mv);
+                        }
+                    }
+                    self.sync.cursor = *hs;
+                }
+            }
+            Event::SyncResynced {
+                relay_seq,
+                acked,
+                levels,
+                ..
+            } => {
+                self.require_role(NetRole::Lane)?;
+                if *acked > self.sync.next_seq {
+                    return Err(DomainError::Sync("ack beyond what was sent"));
+                }
+                self.inventory.set_all(levels);
+                self.sync.acked = self.sync.acked.max(*acked);
+                let a = self.sync.acked;
+                while self.sync.outbox.front().is_some_and(|m| m.seq <= a) {
+                    self.sync.outbox.pop_front();
+                }
+                // The head's levels lack what it has not received yet.
+                let pending: Vec<StockMove> = self
+                    .sync
+                    .outbox
+                    .iter()
+                    .flat_map(|m| m.moves.iter().cloned())
+                    .collect();
+                for mv in &pending {
+                    self.inventory.apply_move(mv);
+                }
+                self.sync.cursor = *relay_seq;
+            }
+            Event::SyncSection {
+                version, section, ..
+            } => {
+                self.require_role(NetRole::Lane)?;
+                let key = section.key();
+                if self.sync.have.get(&key).is_some_and(|v| *v >= *version) {
+                    return Ok(());
+                }
+                self.apply_section(section)?;
+                self.sync.have.insert(key, *version);
+            }
             Event::PictureSet {
                 by,
                 target,
@@ -1020,10 +1403,29 @@ mod snapshot_tests {
         };
         st.config.store_name = "Old store".into();
         let new = postcard::to_allocvec(&st).unwrap();
-        // The two new fields are empty maps: one length byte each.
-        let old = &new[..new.len() - 2];
-        assert!(postcard::from_bytes::<PosState>(old).is_err());
-        assert_eq!(PosState::from_snapshot(old), Some(st.clone()));
+        // Struct fields are serialized in order, like a tuple.
+        let v1 = postcard::to_allocvec(&(
+            &st.config,
+            &st.catalog,
+            &st.users,
+            &st.locks,
+            &st.shift,
+            st.next_receipt,
+            st.next_z,
+            st.next_shift,
+            st.grand_total,
+            &st.refundable,
+            st.events,
+            st.last_event_at,
+        ))
+        .unwrap();
+        let mut v2 = v1.clone();
+        v2.extend(postcard::to_allocvec(&(&st.inventory, &st.pictures)).unwrap());
+        assert!(new.starts_with(&v2) && new.len() > v2.len());
+        for old in [&v1, &v2] {
+            assert!(postcard::from_bytes::<PosState>(old).is_err());
+            assert_eq!(PosState::from_snapshot(old).as_ref(), Some(&st));
+        }
         assert_eq!(PosState::from_snapshot(&new), Some(st));
         assert_eq!(PosState::from_snapshot(&[1, 2, 3]), None);
     }

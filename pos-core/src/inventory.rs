@@ -152,6 +152,23 @@ impl Inventory {
         }
     }
 
+    /// A movement from another till (see [`crate::sync::StockMove`]).
+    pub(crate) fn apply_move(&mut self, m: &crate::sync::StockMove) {
+        if m.track {
+            self.adjust(&m.sku, Qty(m.delta));
+        } else if let Some(l) = self.levels.get_mut(&m.sku) {
+            l.on_hand = Qty(l.on_hand.0.saturating_add(m.delta));
+            if m.delta < 0 {
+                l.sold_since = Qty(l.sold_since.0.saturating_sub(m.delta));
+            }
+        }
+    }
+
+    /// Replace every level (a lane's resync from the head).
+    pub(crate) fn set_all(&mut self, levels: &[(String, StockLevel)]) {
+        self.levels = levels.iter().cloned().collect();
+    }
+
     pub(crate) fn forget(&mut self, sku: &str) {
         self.levels.remove(sku);
     }

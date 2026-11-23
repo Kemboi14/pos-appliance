@@ -67,6 +67,7 @@ fn run(args: &[String]) -> Res<()> {
                 secure_vars: None,
                 hub: f.hub,
                 media_unplugged: false,
+                nic: None,
             })?;
             child.wait()?;
             Ok(())
@@ -74,6 +75,7 @@ fn run(args: &[String]) -> Res<()> {
         "smoke" => smoke(&f),
         "shot" => shot(&f),
         "e2e" => e2e(f.kernel, f.hub),
+        "net-e2e" => net_e2e(f.kernel),
         "keys" => keys(&keys_dir(&f)?),
         "sign" if f.kernel => sign_kernel(&keys_dir(&f)?).map(|_| ()),
         "sign" => sign(&keys_dir(&f)?).map(|_| ()),
@@ -91,6 +93,8 @@ fn run(args: &[String]) -> Res<()> {
                 kernel: true,
                 ..Flags::default()
             })?;
+            net_e2e(false)?;
+            net_e2e(true)?;
             tamper_test()?;
             key_test()?;
             e2e(false, false)?;
@@ -189,7 +193,7 @@ fn build_uefi_bin(
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cargo")))?;
     let rustflags = format!(
-        "--remap-path-prefix={}=/cargo --remap-path-prefix={}=/build -C link-arg=/Brepro",
+        "--remap-path-prefix={}=/cargo --remap-path-prefix={}=/build -C link-arg=/Brepro {SOFT_CRYPTO}",
         home.display(),
         root.display()
     );
@@ -212,6 +216,10 @@ fn build_uefi_bin(
         .join(prof)
         .join(format!("{bin}.efi")))
 }
+
+/// Firmware and kernel targets have SIMD disabled: the ChaCha20/Poly1305
+/// crates must use their portable code (their AVX2 paths fail to compile).
+const SOFT_CRYPTO: &str = "--cfg chacha20_backend=\"soft\" --cfg poly1305_backend=\"soft\"";
 
 fn build_efi(f: &Flags) -> Res<PathBuf> {
     let efi = build_efi_in(f, &root()?.join("target"))?;
@@ -237,7 +245,7 @@ fn build_kernel_in(f: &Flags, target_dir: &Path) -> Res<PathBuf> {
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cargo")))?;
     let rustflags = format!(
         "--remap-path-prefix={}=/cargo --remap-path-prefix={}=/build \
-         -C relocation-model=static -C code-model=kernel",
+         -C relocation-model=static -C code-model=kernel {SOFT_CRYPTO}",
         home.display(),
         root.display()
     );
@@ -371,6 +379,7 @@ fn expect_no_boot(esp: &[(&str, &[u8])], name: &str, secure_vars: Option<PathBuf
         secure_vars,
         hub: false,
         media_unplugged: false,
+        nic: None,
     })?;
     let res = (|| -> Res<bool> {
         let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
@@ -432,6 +441,7 @@ fn key_test() -> Res<()> {
             secure_vars: None,
             hub: false,
             media_unplugged: false,
+            nic: None,
         })?;
         let r = (|| -> Res<()> {
             let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
@@ -630,6 +640,7 @@ fn smoke(f: &Flags) -> Res<()> {
         secure_vars: None,
         hub: f.hub,
         media_unplugged: false,
+        nic: None,
     })?;
     let res = (|| -> Res<()> {
         let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
@@ -747,6 +758,7 @@ fn shot(f: &Flags) -> Res<()> {
         secure_vars: None,
         hub: f.hub,
         media_unplugged: false,
+        nic: None,
     })?;
     let res = (|| -> Res<()> {
         let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
@@ -813,6 +825,7 @@ fn e2e(kernel: bool, hub: bool) -> Res<()> {
         secure_vars: None,
         hub,
         media_unplugged: kernel && reset_vars,
+        nic: None,
     };
     let pause = |ms| std::thread::sleep(Duration::from_millis(ms));
 
@@ -1160,6 +1173,7 @@ fn sb_test(dir: &Path, kernel: bool) -> Res<()> {
         secure_vars: Some(vars.clone()),
         hub: false,
         media_unplugged: false,
+        nic: None,
     };
     // Signed: must reach the UI.
     let mut child = qemu::spawn(&opts(signed))?;
@@ -1215,4 +1229,190 @@ fn sb_test(dir: &Path, kernel: bool) -> Res<()> {
         }
     );
     Ok(())
+}
+
+/// M9 acceptance: a head and a lane till in two VMs joined by a virtual
+/// Ethernet cable. The head imports the catalog, receives stock and becomes
+/// the head; the lane joins with the typed store code, gets the catalog,
+/// users and absolute stock, sells 3; the head's stock then shows the sale.
+/// Stock is checked through STOCK.CSV exported on each till's stick.
+fn net_e2e(kernel: bool) -> Res<()> {
+    let f = Flags {
+        release: true,
+        kernel,
+        ..Flags::default()
+    };
+    let img = image(&f)?;
+    let out = out_dir()?;
+    let human = Duration::from_millis(100);
+    let pause = |ms| std::thread::sleep(Duration::from_millis(ms));
+    // Free a local TCP port for the "cable".
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let mut kids = Vec::new();
+    // Tier B: the lane uses an Intel 82574L, so both kernel drivers run.
+    let lane_model = if kernel { "e1000e" } else { "virtio-net-pci" };
+    let mut till = |name: &str,
+                    nic: String,
+                    mac: &str,
+                    model: &'static str|
+     -> Res<(PathBuf, PathBuf, qemu::Qmp)> {
+        let dir = out.join(format!("net-{name}"));
+        std::fs::create_dir_all(&dir)?;
+        let disk = dir.join("pos.img");
+        std::fs::copy(&img, &disk)?;
+        let media = dir.join("media.img");
+        image::build_media_image(
+            &media,
+            64,
+            &[("CATALOG.CSV", E2E_CATALOG.as_bytes())],
+            source_date_epoch(),
+        )?;
+        let qmp = dir.join("qmp.sock");
+        kids.push(qemu::spawn(&qemu::QemuOpts {
+            image: disk,
+            media: Some(media.clone()),
+            out_dir: dir.clone(),
+            headless: true,
+            qmp: Some(qmp.clone()),
+            reset_vars: true,
+            secure_vars: None,
+            hub: false,
+            // Tier B: Limine must see only the boot stick at power-on.
+            media_unplugged: kernel,
+            nic: Some((nic, mac.into(), model)),
+        })?);
+        let q = qemu::Qmp::connect(&qmp, Duration::from_secs(10))?;
+        Ok((dir, media, q))
+    };
+    let r = (|| -> Res<()> {
+        let (hdir, hmedia, mut h) = till(
+            "head",
+            format!("socket,listen=127.0.0.1:{port}"),
+            "52:54:00:12:34:01",
+            "virtio-net-pci",
+        )?;
+        pause(500);
+        let (ldir, lmedia, mut l) = till(
+            "lane",
+            format!("socket,connect=127.0.0.1:{port}"),
+            "52:54:00:12:34:02",
+            lane_model,
+        )?;
+        let menu_network = |q: &mut qemu::Qmp| -> Res<()> {
+            q.key("f10", &[])?;
+            pause(300);
+            for _ in 0..15 {
+                q.key("down", &[])?;
+                pause(60);
+            }
+            q.key("ret", &[])?;
+            pause(300);
+            Ok(())
+        };
+        let stock_csv = |q: &mut qemu::Qmp, media: &Path| -> Res<String> {
+            q.key("home", &[])?;
+            pause(300);
+            q.type_str("2", human)?;
+            pause(500);
+            q.key("f6", &[])?;
+            pause(1500);
+            let d = image::read_media_file(media, "STOCK.CSV")?
+                .ok_or("net-e2e: no STOCK.CSV written")?;
+            q.key("home", &[])?;
+            pause(300);
+            Ok(String::from_utf8_lossy(&d).into_owned())
+        };
+
+        // Head: manager, catalog, 50 milk received, then head of the store.
+        wait_ui(&mut h, &hdir, Duration::from_secs(90))?;
+        if kernel {
+            h.plug_media(false)?;
+            pause(3000);
+        }
+        h.type_str("Alice\n1234\n1234\n", human)?;
+        pause(1500);
+        h.type_str("1\n1234\n", human)?;
+        pause(1500);
+        h.key("f10", &[])?;
+        pause(300);
+        h.type_str("8", human)?;
+        pause(1500);
+        h.type_str("2milk\n", human)?;
+        pause(500);
+        h.key("f1", &[])?;
+        h.type_str("50\n\n", human)?;
+        pause(800);
+        h.key("home", &[])?;
+        pause(300);
+        menu_network(&mut h)?;
+        h.type_str("2\n1\n10.0.0.1/24\n", human)?;
+        pause(1500);
+        h.screendump(&hdir.join("net_0_head_code.ppm"))?;
+        let key = image::read_media_file(&hmedia, "STORENET.KEY")?
+            .ok_or("net-e2e: head wrote no STORENET.KEY (see net-head/net_0_head_code.ppm)")?;
+        let code = String::from_utf8(key)?.trim().to_string();
+        h.key("ret", &[])?;
+
+        // Lane: own manager, then join with the typed code.
+        wait_ui(&mut l, &ldir, Duration::from_secs(90))?;
+        if kernel {
+            l.plug_media(false)?;
+            pause(3000);
+        }
+        l.type_str("Bob\n1111\n1111\n", human)?;
+        pause(1500);
+        l.type_str("1\n1111\n", human)?;
+        pause(1500);
+        menu_network(&mut l)?;
+        l.type_str(&format!("3\n2\n{code}\n10.0.0.2/24\n10.0.0.1\n"), human)?;
+        pause(1000);
+        l.screendump(&ldir.join("net_1_lane_joined.ppm"))?;
+        l.key("ret", &[])?;
+        // Sync; the lane's own manager is replaced by the head's users.
+        pause(15_000);
+        l.screendump(&ldir.join("net_2_lane_signin.ppm"))?;
+        l.type_str("1\n1234\n", human)?;
+        pause(1500);
+        let lane_stock = stock_csv(&mut l, &lmedia)?;
+        if !lane_stock.contains("MILK,\"Milk 1L\",In stock,50,") {
+            return Err(
+                format!("net-e2e: lane did not get the head's stock:\n{lane_stock}").into(),
+            );
+        }
+        // Lane sells 3 milk.
+        l.type_str("1", human)?;
+        pause(500);
+        l.type_str("100\n", human)?;
+        pause(500);
+        l.type_str("3*4006381333931\n", human)?;
+        pause(500);
+        l.key("f1", &[])?;
+        pause(300);
+        l.key("ret", &[])?;
+        pause(1500);
+        l.screendump(&ldir.join("net_3_lane_sale.ppm"))?;
+        l.key("esc", &[])?;
+        pause(6000);
+        let head_stock = stock_csv(&mut h, &hmedia)?;
+        h.screendump(&hdir.join("net_4_head_stock.ppm"))?;
+        if !head_stock.contains("MILK,\"Milk 1L\",In stock,47,") {
+            return Err(format!(
+                "net-e2e: head stock did not follow the lane's sale:\n{head_stock}"
+            )
+            .into());
+        }
+        println!(
+            "net-e2e: OK - lane joined (catalog, users, stock 50), lane sale reached the head (stock 47)"
+        );
+        let _ = h.quit();
+        let _ = l.quit();
+        Ok(())
+    })();
+    for mut k in kids {
+        let _ = k.kill();
+        let _ = k.wait();
+    }
+    r
 }
