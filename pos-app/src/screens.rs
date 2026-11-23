@@ -10,6 +10,7 @@ use pos_core::auth::{self, PIN_KDF_VERSION, Permission, PinHash, Role, User, Use
 use pos_core::barcode::{self, EmbedKind, Scan};
 use pos_core::cart::{Discount, Line};
 use pos_core::csv::parse_money;
+use pos_core::media::PictureFor;
 use pos_core::shift::ReportKind;
 use pos_core::state::Event;
 use pos_core::tender::{Payment, Tender, TenderKind};
@@ -20,7 +21,8 @@ use pos_ui::scan::Enter;
 use pos_ui::{ButtonStyle, Font, PointerFrame, Rect, Ui};
 
 use crate::receipt;
-use crate::{App, AppError, BootStatus, Hw, Journaled};
+use crate::stock::{self, StockOp};
+use crate::{App, AppError, BootStatus, Hw, Journaled, Place};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pending {
@@ -44,10 +46,13 @@ pub enum Pending {
     ImportSettings,
     AddUser(Role),
     Unlock,
+    Stock(StockOp),
+    ExportStock,
+    ImportPictures,
 }
 
 impl Pending {
-    fn permission(&self) -> Permission {
+    pub(crate) fn permission(&self) -> Permission {
         match self {
             Pending::LineVoid(_) => Permission::LineVoid,
             Pending::VoidSale => Permission::VoidSale,
@@ -62,6 +67,9 @@ impl Pending {
             Pending::ImportSettings => Permission::Configure,
             Pending::AddUser(_) => Permission::ManageUsers,
             Pending::Unlock => Permission::UnlockUser,
+            Pending::Stock(_) => Permission::Stock,
+            Pending::ExportStock => Permission::Export,
+            Pending::ImportPictures => Permission::ManageCatalog,
         }
     }
 }
@@ -92,6 +100,13 @@ pub enum Next {
     AddUserName(Role),
     AddUserPin(Role, String),
     UnlockUser,
+    StockSearch,
+    StockReceiveQty(String),
+    StockReceiveCost(String, Qty),
+    StockCount(String),
+    StockWriteOffQty(String),
+    StockWriteOffReason(String, Qty),
+    StockReorder(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,10 +148,17 @@ impl Next {
             | Next::VoucherCode
             | Next::RefundReason(..)
             | Next::RefundCardRef(..)
-            | Next::AddUserName(_) => Input::Text,
-            Next::Float | Next::VoucherAmount(_) | Next::ZCounted | Next::RefundQty(..) => {
-                Input::Amount
-            }
+            | Next::AddUserName(_)
+            | Next::StockSearch => Input::Text,
+            Next::Float
+            | Next::VoucherAmount(_)
+            | Next::ZCounted
+            | Next::RefundQty(..)
+            | Next::StockReceiveQty(_)
+            | Next::StockReceiveCost(..)
+            | Next::StockCount(_)
+            | Next::StockWriteOffQty(_)
+            | Next::StockReorder(_) => Input::Amount,
             Next::AdoptUser
             | Next::AdoptPin(_)
             | Next::SetupPin1(_)
@@ -149,6 +171,7 @@ impl Next {
             | Next::ReprintNo
             | Next::RefundReceipt
             | Next::RefundPayout(..)
+            | Next::StockWriteOffReason(..)
             | Next::UnlockUser => Input::Digits,
         }
     }
@@ -208,9 +231,15 @@ pub enum Screen {
         sel: usize,
         picks: Vec<(u16, Qty)>,
     },
+    /// The home screen with the apps.
+    Home,
+    /// Inventory: the stock list (its state is in `App::stock`).
+    Stock,
+    /// Inventory: one product.
+    StockItem(String),
 }
 
-fn prompt(title: &str, hint: &str, secret: bool, next: Next) -> Screen {
+pub(crate) fn prompt(title: &str, hint: &str, secret: bool, next: Next) -> Screen {
     Screen::Prompt(Prompt {
         title: title.into(),
         hint: hint.into(),
@@ -321,6 +350,7 @@ pub(crate) fn on_key<D: BlockDevice>(
         Screen::Menu { sel } => menu_key(app, sel, key, hw),
         Screen::Info { title, lines } => match key {
             Key::Enter | Key::Escape => back_to_work(app),
+            Key::Home => go_home(app),
             _ => Screen::Info { title, lines },
         },
         Screen::RefundPick {
@@ -330,12 +360,50 @@ pub(crate) fn on_key<D: BlockDevice>(
         } => refund_pick_key(app, receipt, sel, picks, key),
         Screen::Fatal(m) => Screen::Fatal(m),
         Screen::Blank => back_to_work(app),
+        Screen::Home => home_key(app, key, hw),
+        Screen::Stock => stock::list_key(app, key, at, hw),
+        Screen::StockItem(sku) => stock::item_key(app, sku, key),
     };
+}
+
+fn home_key<D: BlockDevice>(app: &mut App<D>, key: Key, hw: &mut Hw<'_>) -> Screen {
+    match key {
+        Key::Char('1') | Key::Enter => {
+            app.place = Place::Till;
+            back_to_work(app)
+        }
+        Key::Char('2') => stock::open(app),
+        Key::F(10) => Screen::Menu { sel: 0 },
+        Key::F(12) => sign_out(app, hw),
+        _ => Screen::Home,
+    }
+}
+
+pub(crate) fn sign_out<D: BlockDevice>(app: &mut App<D>, hw: &mut Hw<'_>) -> Screen {
+    if let Some(u) = app.user.take() {
+        let now = app.now(hw);
+        let _ = app.commit(vec![Event::Logout { user: u, at: now }]);
+    }
+    app.place = Place::Home;
+    app.stock = Default::default();
+    login_prompt(app)
+}
+
+/// Leave the current app for the home screen (not with a sale open).
+pub(crate) fn go_home<D: BlockDevice>(app: &mut App<D>) -> Screen {
+    if app.place == Place::Till && !app.cart.is_empty() {
+        app.set_msg("Finish or void the sale first", true);
+        return Screen::Sale;
+    }
+    app.place = Place::Home;
+    Screen::Home
 }
 
 fn back_to_work<D: BlockDevice>(app: &App<D>) -> Screen {
     match app.user {
         None => login_prompt(app),
+        Some(_) if app.place == Place::Home => Screen::Home,
+        Some(_) if app.place == Place::Inventory => Screen::Stock,
         Some(_) if app.state.shift.is_none() => prompt(
             "Open shift",
             "Opening cash float (e.g. 100.00), Enter",
@@ -377,6 +445,13 @@ fn prompt_key<D: BlockDevice>(
             }
             Next::LoginPin(_) => login_prompt(app),
             Next::CardRef(_) | Next::VoucherCode | Next::VoucherAmount(_) => Screen::Pay,
+            Next::StockSearch => Screen::Stock,
+            Next::StockReceiveQty(s)
+            | Next::StockReceiveCost(s, _)
+            | Next::StockCount(s)
+            | Next::StockWriteOffQty(s)
+            | Next::StockWriteOffReason(s, _)
+            | Next::StockReorder(s) => Screen::StockItem(s),
             _ => back_to_work(app),
         },
         Key::Enter => {
@@ -579,6 +654,7 @@ fn submit<D: BlockDevice>(app: &mut App<D>, p: Prompt, field: String, hw: &mut H
                 Ok(_) if ok => {
                     app.user = Some(u);
                     app.message = None;
+                    app.place = Place::Home;
                     back_to_work(app)
                 }
                 Ok(_) => {
@@ -828,11 +904,81 @@ fn submit<D: BlockDevice>(app: &mut App<D>, p: Prompt, field: String, hw: &mut H
             }
             _ => again(p, app, "User number"),
         },
+        Next::StockSearch => {
+            app.stock.query = field.trim().into();
+            app.stock.sel = 0;
+            Screen::Stock
+        }
+        Next::StockReceiveQty(sku) => match parse_qty(&field) {
+            Some(q) if pos_core::inventory::valid_qty(q) => prompt(
+                &p.title,
+                "Unit cost (optional) - Enter to skip",
+                false,
+                Next::StockReceiveCost(sku, q),
+            ),
+            _ => again(p, app, "Enter a quantity"),
+        },
+        Next::StockReceiveCost(sku, qty) => {
+            let cost = if field.trim().is_empty() {
+                None
+            } else {
+                match parse_money(&field, app.state.config.decimals) {
+                    Some(c) if !c.is_negative() => Some(c),
+                    _ => return again(p, app, "Enter a cost, or leave it empty"),
+                }
+            };
+            authorize(app, Pending::Stock(StockOp::Receive { sku, qty, cost }), hw)
+        }
+        Next::StockCount(sku) => match parse_qty0(&field) {
+            Some(counted) => authorize(app, Pending::Stock(StockOp::Count { sku, counted }), hw),
+            None => again(p, app, "Enter the quantity counted"),
+        },
+        Next::StockWriteOffQty(sku) => match parse_qty(&field) {
+            Some(q) if pos_core::inventory::valid_qty(q) => prompt(
+                &p.title,
+                "Reason: 1 Damaged, 2 Expired, 3 Theft/loss, 4 Returned to supplier, 5 Other",
+                false,
+                Next::StockWriteOffReason(sku, q),
+            ),
+            _ => again(p, app, "Enter a quantity"),
+        },
+        Next::StockWriteOffReason(sku, qty) => {
+            let k: usize = field.trim().parse().unwrap_or(0);
+            match pos_core::inventory::Adjust::ALL.get(k.wrapping_sub(1)) {
+                Some(reason) => authorize(
+                    app,
+                    Pending::Stock(StockOp::WriteOff {
+                        sku,
+                        qty,
+                        reason: *reason,
+                    }),
+                    hw,
+                ),
+                None => again(p, app, "Choose a reason 1-5"),
+            }
+        }
+        Next::StockReorder(sku) => match parse_qty0(&field) {
+            Some(level) => authorize(app, Pending::Stock(StockOp::Reorder { sku, level }), hw),
+            None => again(p, app, "Enter a quantity (0 for none)"),
+        },
     }
 }
 
+/// Quantity that may be zero (counts, reorder levels).
+fn parse_qty0(s: &str) -> Option<Qty> {
+    let s = s.trim();
+    if s.chars().all(|c| c == '0' || c == '.') && !s.is_empty() {
+        return Some(Qty(0));
+    }
+    parse_qty(s)
+}
+
 /// Run `pending` if the signed-in user may; otherwise ask for a manager.
-fn authorize<D: BlockDevice>(app: &mut App<D>, pending: Pending, hw: &mut Hw<'_>) -> Screen {
+pub(crate) fn authorize<D: BlockDevice>(
+    app: &mut App<D>,
+    pending: Pending,
+    hw: &mut Hw<'_>,
+) -> Screen {
     match app.user {
         Some(u) if app.state.allows(u, pending.permission()) => execute(app, pending, u, false, hw),
         Some(_) => prompt(
@@ -1100,6 +1246,49 @@ fn execute<D: BlockDevice>(
                 Next::UnlockUser,
             )
         }
+        Pending::Stock(op) => {
+            let sku = op.sku().to_string();
+            let msg = stock::done_message(&op);
+            events.push(stock::event(app, op, by, now));
+            match app.commit(events) {
+                Ok(_) => app.set_msg(msg, false),
+                Err(e) => app.err(&e),
+            }
+            Screen::StockItem(sku)
+        }
+        Pending::ExportStock => {
+            if !hw.media.is_present() {
+                app.set_msg("Insert a FAT-formatted USB stick for export", true);
+                return back_to_work(app);
+            }
+            let csv = stock::stock_csv(app);
+            match hw.media.write_file("STOCK.CSV", csv.as_bytes()) {
+                Ok(()) => {
+                    events.push(Event::Exported {
+                        by,
+                        at: now,
+                        what: "STOCK.CSV".into(),
+                        bytes: csv.len() as u64,
+                    });
+                    match app.commit(events) {
+                        Ok(_) => app.set_msg(
+                            format!("STOCK.CSV written ({} products)", app.state.catalog.len()),
+                            false,
+                        ),
+                        Err(e) => app.err(&e),
+                    }
+                }
+                Err(e) => app.set_msg(format!("STOCK.CSV: {e}"), true),
+            }
+            back_to_work(app)
+        }
+        Pending::ImportPictures => {
+            match crate::pictures::import(app, hw, by, now, events) {
+                Ok(s) => app.set_msg(s, false),
+                Err(e) => app.set_msg(e, true),
+            }
+            back_to_work(app)
+        }
     }
 }
 
@@ -1338,15 +1527,12 @@ fn sale_key<D: BlockDevice>(app: &mut App<D>, key: Key, at: u64, hw: &mut Hw<'_>
         }
         Key::F(12) => {
             if app.cart.is_empty() {
-                if let Some(u) = app.user.take() {
-                    let now = app.now(hw);
-                    let _ = app.commit(vec![Event::Logout { user: u, at: now }]);
-                }
-                app.screen = login_prompt(app);
+                app.screen = sign_out(app, hw);
             } else {
                 app.set_msg("Finish or void the sale before signing out", true);
             }
         }
+        Key::Home => app.screen = go_home(app),
         _ => app.scan.other_key(),
     }
 }
@@ -1531,6 +1717,8 @@ const MENU: &[&str] = &[
     "Add manager",
     "Unlock user",
     "Journal status",
+    "Import pictures from USB (IMG_<SKU>.JPG, LOGO, WALLPAPER)",
+    "Export stock list (STOCK.CSV)",
     "Back",
 ];
 
@@ -1543,6 +1731,7 @@ fn menu_key<D: BlockDevice>(app: &mut App<D>, sel: usize, key: Key, hw: &mut Hw<
             sel: (sel + 1).min(MENU.len() - 1),
         },
         Key::Escape => back_to_work(app),
+        Key::Home => go_home(app),
         Key::Char(c) if c.is_ascii_digit() => {
             let i = (c as u8 - b'0') as usize;
             let i = if i == 0 { 9 } else { i - 1 };
@@ -1609,9 +1798,17 @@ fn menu_select<D: BlockDevice>(app: &mut App<D>, i: usize, hw: &mut Hw<'_>) -> S
                         )
                     ),
                     format!("Catalog items: {}", st.catalog.len()),
+                    format!(
+                        "Stock tracked: {}   Pictures: {} ({} KB)",
+                        st.inventory.tracked(),
+                        st.pictures.len(),
+                        st.pictures.bytes() / 1024
+                    ),
                 ],
             }
         }
+        13 => authorize(app, Pending::ImportPictures, hw),
+        14 => authorize(app, Pending::ExportStock, hw),
         _ => back_to_work(app),
     }
 }
@@ -1697,6 +1894,8 @@ pub(crate) enum UiAction {
     RefundRow(usize),
     Page(isize),
     TogglePad,
+    /// A row of the stock list (index into the drawn window).
+    StockRow(usize),
 }
 
 /// Run one frame with the tap so widgets can see it, then act on it.
@@ -1774,6 +1973,12 @@ pub(crate) fn on_click<D: BlockDevice>(
             app.qk_page = (app.qk_page as isize + d).clamp(0, (n - 1).max(0)) as usize;
         }
         UiAction::TogglePad => app.sale_pad = !app.sale_pad,
+        UiAction::StockRow(k) => {
+            if matches!(app.screen, Screen::Stock) {
+                app.stock.sel = app.stock.sel.saturating_sub(16) + k;
+                key(app, Key::Enter, hw);
+            }
+        }
     }
 }
 
@@ -1970,6 +2175,10 @@ struct View {
     refund_lines: Vec<String>,
     last_sale: Option<pos_core::sale::Sale>,
     choices: Vec<(String, String)>,
+    desk: Option<crate::desktop::DeskView>,
+    stock: Option<stock::StockView>,
+    qk_pics: alloc::collections::BTreeMap<String, alloc::sync::Arc<pos_ui::image::Bitmap>>,
+    signed_in: bool,
 }
 
 fn prompt_choices<D: BlockDevice>(app: &App<D>, next: &Next, now: i64) -> Vec<(String, String)> {
@@ -1991,6 +2200,11 @@ fn prompt_choices<D: BlockDevice>(app: &App<D>, next: &Next, now: i64) -> Vec<(S
             ("Back to card".into(), "2".into()),
             ("Voucher".into(), "3".into()),
         ],
+        Next::StockWriteOffReason(..) => pos_core::inventory::Adjust::ALL
+            .iter()
+            .enumerate()
+            .map(|(k, a)| (a.label().into(), format!("{}", k + 1)))
+            .collect(),
         _ => Vec::new(),
     };
     // More tiles than fit comfortably: fall back to typing the number.
@@ -2067,9 +2281,50 @@ fn view<D: BlockDevice>(app: &App<D>, now: i64) -> View {
         refund_lines,
         last_sale: app.last_sale.clone(),
         choices,
+        desk: None,
+        stock: stock::view(app),
+        qk_pics: app
+            .state
+            .catalog
+            .quick_keys()
+            .into_iter()
+            .filter_map(|i| {
+                app.gallery
+                    .get(&PictureFor::Item(i.sku.clone()))
+                    .map(|b| (i.sku.clone(), b))
+            })
+            .collect(),
+        signed_in: app.user.is_some(),
         screen,
         cfg,
     }
+}
+
+fn is_desktop(s: &Screen) -> bool {
+    matches!(s, Screen::Home)
+        || matches!(s, Screen::Prompt(p) if matches!(p.next, Next::LoginUser | Next::LoginPin(_)))
+}
+
+/// Decode the pictures this frame may draw.
+fn prepare_pictures<D: BlockDevice>(app: &mut App<D>) {
+    let mut keys = Vec::new();
+    if is_desktop(&app.screen) {
+        crate::desktop::wanted(app, &mut keys);
+    }
+    if matches!(app.screen, Screen::Sale | Screen::Pay | Screen::Done { .. }) {
+        keys.extend(
+            app.state
+                .catalog
+                .quick_keys()
+                .into_iter()
+                .filter(|i| {
+                    i.quick_key.map(usize::from).map(|q| q / QK_PER_PAGE) == Some(app.qk_page)
+                })
+                .map(|i| PictureFor::Item(i.sku.clone())),
+        );
+    }
+    stock::wanted(app, &mut keys);
+    app.gallery.prepare(&app.state.pictures, &keys);
 }
 
 /// Draw one frame. `ptr` carries the pointer state; `held_from` is where
@@ -2080,9 +2335,27 @@ pub(crate) fn draw<D: BlockDevice>(
     held_from: Option<(i32, i32)>,
     now: i64,
 ) -> Option<UiAction> {
-    let v = view(app, now);
+    prepare_pictures(app);
+    let mut v = view(app, now);
+    if is_desktop(&v.screen) {
+        v.desk = Some(crate::desktop::view(app, now));
+    }
     let mut ui = Ui::new(&mut app.canvas, ptr, held_from);
     let mut action = None;
+    if let Some(d) = &v.desk {
+        action = match &v.screen {
+            Screen::Prompt(p) => {
+                let mut pad = |ui: &mut Ui<'_>, r: Rect| {
+                    let side = r.h.min(r.w * 3 / 4);
+                    numpad(ui, r.centered(side * 4 / 3, side), Pad::Digits)
+                };
+                crate::desktop::draw_lock(&mut ui, d, p, &v.message, &mut pad)
+            }
+            _ => crate::desktop::draw_home(&mut ui, d, &v.message),
+        };
+        app.targets = core::mem::take(&mut ui.targets);
+        return action;
+    }
     ui.clear();
     let u = ui.u();
     let full = ui.c.bounds();
@@ -2090,6 +2363,24 @@ pub(crate) fn draw<D: BlockDevice>(
     let (top, rest) = full.split_top(status_h);
     let (body, bottom) = rest.split_bottom(ui.c.line_height(Font::Bold) + 2 * u);
     ui.c.fill_rect(top, ui.theme.panel);
+    let home_able = v.signed_in
+        && matches!(
+            v.screen,
+            Screen::Sale
+                | Screen::Menu { .. }
+                | Screen::Info { .. }
+                | Screen::Stock
+                | Screen::StockItem(_)
+        );
+    let top = if home_able {
+        let (h, rest) = top.split_left(ui.c.text_width("Home", Font::Bold) + 3 * u);
+        if ui.button_font(h.inset(u / 4), "Home", ButtonStyle::Normal, Font::Bold) {
+            action = Some(UiAction::Key(Key::Home));
+        }
+        rest
+    } else {
+        top
+    };
     ui.label(top.inset(u), &v.status, Font::Normal, 0);
     if let Some((m, err)) = &v.message {
         let col = if *err { ui.theme.danger } else { ui.theme.ok };
@@ -2107,9 +2398,30 @@ pub(crate) fn draw<D: BlockDevice>(
             ui.label(t, "FATAL", Font::Large, 1);
             ui.c.text_wrapped(r.inset(2 * u), m, Font::Normal, ui.theme.text);
         }
-        Screen::Prompt(p) => action = draw_prompt(&mut ui, body, p, &v.choices),
+        Screen::Prompt(p) => {
+            if let Some(a) = draw_prompt(&mut ui, body, p, &v.choices) {
+                action = Some(a);
+            }
+        }
+        Screen::Home => {}
+        Screen::Stock => {
+            if let Some(s) = &v.stock
+                && let Some(a) = stock::draw_list(&mut ui, body, s)
+            {
+                action = Some(a);
+            }
+        }
+        Screen::StockItem(_) => {
+            if let Some(s) = &v.stock
+                && let Some(a) = stock::draw_item(&mut ui, body, s)
+            {
+                action = Some(a);
+            }
+        }
         Screen::Sale | Screen::Pay | Screen::Done { .. } => {
-            action = draw_sale(&mut ui, body, &v, &money);
+            if let Some(a) = draw_sale(&mut ui, body, &v, &money) {
+                action = Some(a);
+            }
         }
         Screen::Search { query, sel } => {
             let (t, r) = body.split_top(7 * u);
@@ -2581,9 +2893,18 @@ fn draw_sale(
                     .filter(|(pos, ..)| pos / QK_PER_PAGE == v.qk_page)
                     .collect();
                 let font = ui.grid_font(cells[0], page.iter().map(|q| q.2.as_str()));
+                let pic_font = if font == Font::Large {
+                    Font::Bold
+                } else {
+                    Font::Small
+                };
                 for (pos, sku, name) in page {
                     let cell = cells[pos % QK_PER_PAGE];
-                    if ui.button_font(cell, name, ButtonStyle::Normal, font) {
+                    let tapped = match v.qk_pics.get(sku) {
+                        Some(b) => crate::desktop::picture_key(ui, cell, name, b, pic_font),
+                        None => ui.button_font(cell, name, ButtonStyle::Normal, font),
+                    };
+                    if tapped {
                         action = Some(UiAction::Code(sku.clone()));
                     }
                 }

@@ -21,6 +21,8 @@ pub mod catalog;
 pub mod config;
 pub mod csv;
 pub mod fiscal;
+pub mod inventory;
+pub mod media;
 pub mod money;
 pub mod sale;
 pub mod shift;

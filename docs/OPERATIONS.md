@@ -1,11 +1,22 @@
 # Operating the till
 
+## Passwords
+
+There are **no default passwords or PINs**. On first boot the till asks
+for the manager's name and a 4–8 digit PIN; that manager is user number 1.
+Managers add cashiers (and further managers) with their own PINs from the
+manager menu. PINs are stored only as Argon2id hashes; a forgotten PIN
+cannot be read back — another manager resets it by unlocking or re-adding
+the user. Five wrong PINs lock a user (managers: a timed lockout).
+
 ## First boot
 
 1. "First-time setup": manager name, PIN (4–8 digits) twice. The store is bound to this machine.
-2. Sign in (tap your name, or type your user number) and PIN; enter the opening float.
-3. Manager menu (F10) → 9 "Import settings" (`SETTINGS.TXT`) and 8 "Import catalog" (`CATALOG.CSV`) from a FAT USB stick.
-4. F10 → "Add cashier".
+2. The sign-in screen shows the clock and a tile per user: tap your name (or type your user number), then your PIN.
+3. The home screen shows the two apps, **Till** and **Inventory**, plus the manager menu and sign out. Keys: `1`/Enter Till, `2` Inventory, F10 menu, F12 sign out.
+4. Manager menu (F10) → 9 "Import settings" (`SETTINGS.TXT`) and 8 "Import catalog" (`CATALOG.CSV`) from a FAT USB stick, then "Import pictures".
+5. F10 → "Add cashier".
+6. Open **Till**: enter the opening float. The **Home** button (top left, or the Home key) goes back to the home screen when no sale is open.
 
 ## Sale screen keys
 
@@ -41,6 +52,35 @@ Everything can be done by touch alone; every on-screen button does the same as i
 * **Names, codes, reasons and search** get an on-screen keyboard. Its ⇧ key cycles: off → next letter only → CAPS → off.
 * **Sign-in and manager override** show a tile for each user (up to 12; with more, type the user number).
 * Buttons light up while pressed and act when the finger lifts on the same button, so sliding off cancels. A second tap within 150 ms on the same spot is treated as panel bounce and ignored.
+
+## Inventory
+
+Open **Inventory** from the home screen. The top cards show products, low and out-of-stock counts and the stock's retail value.
+
+* Tabs: **All**, **Low** (at or below the reorder level, or out), **Out**, **Not tracked** (F1–F4). **Search** (F5) or just type; a scanned barcode opens that product. **Export** (F6) writes `STOCK.CSV`.
+* Tap a product (or Enter) for its page: picture, stock on hand, reorder level, last cost, last delivery and count.
+  * **Receive** (F1): quantity delivered, then unit cost (optional).
+  * **Count** (F2): the quantity on the shelf replaces the book stock; the difference is journaled as the variance.
+  * **Write off** (F3): quantity and reason (damaged, expired, theft/loss, returned to supplier, other).
+  * **Reorder level** (F4): flag the product as low at this quantity (0 = never).
+* A product is *tracked* from its first delivery or count. Sales take tracked stock off automatically and refunds put it back; untracked products (services, bags) are sold without stock. Stock may go negative — the till never refuses a sale over it; count the product.
+* Stock changes need the **stock** permission (managers). A cashier gets the manager-override prompt.
+* Every stock change is a journal event like a sale (in the hash chain, exported in the journal CSV).
+
+`STOCK.CSV`: `sku,name,status,on_hand,reorder_at,last_cost,retail_value`.
+
+## Pictures
+
+Manager menu → "Import pictures from USB" reads these files from the root of a FAT stick (JPEG or PNG; up to 12 megapixels each):
+
+| File | Used for |
+|---|---|
+| `IMG_<SKU>.JPG` (or `.PNG`) | product picture: quick keys, inventory list and page |
+| `USER_<number>.JPG` | user photo on the sign-in and home screens |
+| `LOGO.PNG` | store logo in the top bar (transparency kept) |
+| `WALLPAPER.JPG` | background of the sign-in and home screens (cropped to 16:9) |
+
+Characters a file name cannot hold (`/ \ : * ? " < > |`) are written `_` in `IMG_<SKU>`. Pictures are shrunk on import (products and users 128 px, logo 512×256, wallpaper 640×360), stored losslessly in the journal and survive reboots. Importing again replaces them. Picture storage is limited to about half a snapshot slot; the import says which files were skipped and why.
 
 ## CATALOG.CSV
 

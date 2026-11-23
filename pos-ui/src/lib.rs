@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+pub mod image;
 pub mod scan;
 mod text;
 
@@ -211,7 +212,7 @@ impl Canvas {
     }
 
     #[inline]
-    fn blend(&mut self, x: i32, y: i32, c: Rgb888, a: u8) {
+    pub(crate) fn blend(&mut self, x: i32, y: i32, c: Rgb888, a: u8) {
         if a == 0 || x < 0 || y < 0 || x >= self.w || y >= self.h {
             return;
         }
@@ -219,7 +220,7 @@ impl Canvas {
         self.px[i] = mix(self.px[i], c, a);
     }
 
-    fn mark(&mut self, r: Rect) {
+    pub(crate) fn mark(&mut self, r: Rect) {
         let r = clip(r, self.bounds());
         if r.w <= 0 || r.h <= 0 {
             return;
@@ -770,7 +771,7 @@ mod tests {
     #[test]
     fn text_draws_every_needed_glyph() {
         let mut c = Canvas::new(1024, 768);
-        let set = "Aé€£¥₹₦₱₽₺₩ŠŒ…←→⇧⌫◀▶✓✕•×›−";
+        let set = "Aé€£¥₹₦₱₽₺₩ŠŒ…←→⇧⌫◀▶✓✕•×›−·";
         let mut x = 0;
         for ch in set.chars() {
             let s = ch.encode_utf8(&mut [0; 4]).to_owned();

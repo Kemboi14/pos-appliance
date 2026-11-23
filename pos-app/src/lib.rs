@@ -12,11 +12,14 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod desktop;
 pub mod export;
 pub mod hasher;
+pub mod pictures;
 pub mod receipt;
 mod screens;
 pub mod settings;
+pub mod stock;
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -126,6 +129,11 @@ pub fn kind_code(e: &Event) -> u16 {
         Event::Report(_) => 18,
         Event::Exported { .. } => 19,
         Event::StoreAdopted { .. } => 20,
+        Event::StockReceived { .. } => 21,
+        Event::StockCounted { .. } => 22,
+        Event::StockWrittenOff { .. } => 23,
+        Event::ReorderLevelSet { .. } => 24,
+        Event::PictureSet { .. } => 25,
     }
 }
 
@@ -137,6 +145,14 @@ pub enum Journaled {
 }
 
 const RECENT: usize = 64;
+
+/// Which app the signed-in user is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    Home,
+    Till,
+    Inventory,
+}
 
 pub struct App<D: BlockDevice> {
     pub(crate) store: Option<Store<D>>,
@@ -173,6 +189,9 @@ pub struct App<D: BlockDevice> {
     pub(crate) now_us: u64,
     /// Device kept while the store cannot be opened (format/recovery flow).
     pub(crate) pending_dev: Option<D>,
+    pub(crate) place: Place,
+    pub(crate) stock: stock::StockList,
+    pub(crate) gallery: pictures::Gallery,
 }
 
 impl<D: BlockDevice> core::fmt::Debug for App<D> {
@@ -234,6 +253,9 @@ impl<D: BlockDevice> App<D> {
             printer_ok: true,
             now_us: 0,
             pending_dev: None,
+            place: Place::Home,
+            stock: stock::StockList::default(),
+            gallery: pictures::Gallery::default(),
         };
         let status = match Store::open(dev, &key) {
             Ok(rec) => {
@@ -282,9 +304,7 @@ impl<D: BlockDevice> App<D> {
         records: &[pos_store::Record],
     ) -> Result<(), String> {
         let mut st = match snapshot {
-            Some(b) => {
-                postcard::from_bytes::<PosState>(b).map_err(|_| String::from("snapshot decode"))?
-            }
+            Some(b) => PosState::from_snapshot(b).ok_or_else(|| String::from("snapshot decode"))?,
             None => PosState::default(),
         };
         for r in records {
@@ -319,6 +339,9 @@ impl<D: BlockDevice> App<D> {
     }
     pub fn screen(&self) -> &Screen {
         &self.screen
+    }
+    pub fn place(&self) -> Place {
+        self.place
     }
     pub fn cart(&self) -> &Cart {
         &self.cart
@@ -364,6 +387,9 @@ impl<D: BlockDevice> App<D> {
         self.state = trial;
         for (e, c) in events.iter().zip(&committed) {
             self.remember(e, &c.hash);
+        }
+        if events.iter().any(|e| matches!(e, Event::PictureSet { .. })) {
+            self.gallery.clear();
         }
         // Periodic snapshot; failure only costs a longer replay next boot.
         let every = u64::from(self.state.config.snapshot_every);

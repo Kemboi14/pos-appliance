@@ -264,7 +264,7 @@ fn bring_up<D: BlockDevice>(rig: &mut Rig, app: &mut App<D>) {
         "{:?}",
         app.message()
     );
-    rig.typ(app, "1\n1234\n"); // login manager
+    rig.typ(app, "1\n1234\n\n"); // login manager
     rig.typ(app, "100.00\n"); // float
     assert!(matches!(app.screen(), Screen::Sale), "{:?}", app.screen());
     rig.media
@@ -286,7 +286,7 @@ fn full_day_flow() {
     bring_up(&mut rig, &mut app);
     // Sign out manager, sign in cashier.
     rig.key(&mut app, Key::F(12), 100_000);
-    rig.typ(&mut app, "2\n0000\n");
+    rig.typ(&mut app, "2\n0000\n\n");
     assert!(matches!(app.screen(), Screen::Sale));
 
     // Scanned EAN-13, scanned UPC-A (normalised), typed EAN-8 with qty 3*.
@@ -379,7 +379,7 @@ fn full_day_flow() {
     assert!(app.state().shift.is_none());
     assert_eq!(app.state().next_z, 2);
     rig.key(&mut app, Key::Enter, 100_000);
-    rig.typ(&mut app, "1\n1234\n");
+    rig.typ(&mut app, "1\n1234\n\n");
     rig.typ(&mut app, "50\n"); // new shift float
     rig.key(&mut app, Key::F(10), 100_000);
     rig.typ(&mut app, "7");
@@ -447,7 +447,7 @@ fn power_cut_during_sale_commit_every_write() {
             continue;
         }
         let mut rig = Rig::new();
-        rig.typ(&mut app, "1\n1234\n");
+        rig.typ(&mut app, "1\n1234\n\n");
         rig.scan(&mut app, "4006381333931");
         rig.key(&mut app, Key::F(1), 100_000);
         let ctl = rig.key(&mut app, Key::Enter, 100_000);
@@ -607,7 +607,11 @@ fn touch_only_day(w: u32, h: u32) {
     // Sign in by tapping the name tile.
     rig.shot(&app, "t2_login");
     rig.tap(&mut app, "Alice (1)");
+    rig.shot(&app, "t2b_pin");
     rig.taps(&mut app, &["1", "2", "3", "4", "OK"]);
+    assert!(matches!(app.screen(), Screen::Home), "{:?}", app.screen());
+    rig.shot(&app, "t2c_home");
+    rig.tap(&mut app, "Till");
     rig.taps(&mut app, &["1", "0", "0", "OK"]); // float
     assert!(matches!(app.screen(), Screen::Sale), "{:?}", app.screen());
 
@@ -729,4 +733,192 @@ fn scan_on_change_screen_starts_next_sale() {
     rig.scan(&mut app, "96385074");
     assert!(matches!(app.screen(), Screen::Sale));
     assert_eq!(app.cart().lines.len(), 1, "{:?}", app.message());
+}
+
+fn fixture(n: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/../pos-ui/tests/data/{n}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
+fn on_hand<D: BlockDevice>(app: &App<D>, sku: &str) -> i64 {
+    app.state()
+        .inventory
+        .get(sku)
+        .map_or(i64::MIN, |l| l.on_hand.0 / 1000)
+}
+
+/// Pictures from USB, the home screen's two apps, and the Inventory app:
+/// receive, reorder level, sales and refunds moving stock, write-off,
+/// count, a cashier needing a manager, STOCK.CSV, and a reboot.
+#[test]
+fn inventory_and_pictures() {
+    use pos_core::inventory::StockStatus;
+    use pos_core::media::PictureFor;
+    let mut rig = Rig::new();
+    let (mut app, _) = boot(fresh_device());
+    bring_up(&mut rig, &mut app);
+
+    let m = &mut rig.media.0;
+    m.insert("IMG_MILK.JPG".into(), fixture("photo.jpg"));
+    m.insert("IMG_SOAP.PNG".into(), fixture("palette.png"));
+    m.insert("IMG_BREAD.PNG".into(), b"not a picture".to_vec());
+    m.insert("LOGO.PNG".into(), fixture("logo.png"));
+    m.insert("WALLPAPER.JPG".into(), fixture("photo_progressive.jpg"));
+    m.insert("USER_1.JPG".into(), fixture("photo.jpg"));
+    rig.key(&mut app, Key::F(10), 100_000);
+    rig.tap(
+        &mut app,
+        "Import pictures from USB (IMG_<SKU>.JPG, LOGO, WALLPAPER)",
+    );
+    let msg = app.message().unwrap_or("").to_string();
+    assert!(
+        msg.contains("2 products") && msg.contains("1 users"),
+        "{msg}"
+    );
+    assert!(msg.contains("logo") && msg.contains("wallpaper"), "{msg}");
+    assert!(msg.contains("IMG_BREAD.PNG: not a PNG or JPEG"), "{msg}");
+    let pics = &app.state().pictures;
+    assert_eq!(pics.len(), 5);
+    let milk = pics.item("MILK").unwrap();
+    assert_eq!((milk.w, milk.h), (128, 80), "aspect kept, shrunk to 128");
+    let wall = pics.get(&PictureFor::Wallpaper).unwrap();
+    assert_eq!((wall.w, wall.h), (640, 360), "wallpaper cropped to 16:9");
+    assert!(matches!(app.screen(), Screen::Sale), "{:?}", app.screen());
+    rig.shot(&app, "i0_sale_pictures");
+
+    // Home screen with the two apps.
+    rig.key(&mut app, Key::Home, 100_000);
+    assert!(matches!(app.screen(), Screen::Home));
+    rig.shot(&app, "i1_home");
+    rig.key(&mut app, Key::Char('2'), 100_000);
+    assert!(matches!(app.screen(), Screen::Stock));
+    rig.shot(&app, "i2_stock");
+
+    // Find milk by typing; open it; receive 24 at 0.80; reorder at 5.
+    rig.typ(&mut app, "milk\n");
+    assert_eq!(app.screen(), &Screen::StockItem("MILK".into()));
+    rig.key(&mut app, Key::F(1), 100_000);
+    rig.typ(&mut app, "24\n0.80\n");
+    assert_eq!(on_hand(&app, "MILK"), 24, "{:?}", app.message());
+    rig.key(&mut app, Key::F(4), 100_000);
+    rig.typ(&mut app, "5\n");
+    rig.shot(&app, "i3_item");
+    assert_eq!(app.state().inventory.status("MILK"), StockStatus::Ok);
+    // A scanned barcode in the list opens the item directly.
+    rig.key(&mut app, Key::Escape, 100_000);
+    rig.scan(&mut app, "96385074");
+    assert_eq!(app.screen(), &Screen::StockItem("BREAD".into()));
+    rig.key(&mut app, Key::Escape, 100_000);
+
+    // Sell 20 milk at the till: stock follows; untracked bread doesn't.
+    rig.key(&mut app, Key::Home, 100_000);
+    rig.key(&mut app, Key::Char('1'), 100_000);
+    assert!(matches!(app.screen(), Screen::Sale));
+    rig.typ(&mut app, "20*4006381333931\n");
+    rig.scan(&mut app, "96385074");
+    rig.key(&mut app, Key::F(1), 100_000);
+    rig.key(&mut app, Key::Enter, 100_000);
+    assert!(
+        matches!(app.screen(), Screen::Done { .. }),
+        "{:?}",
+        app.message()
+    );
+    rig.key(&mut app, Key::Escape, 100_000);
+    assert_eq!(on_hand(&app, "MILK"), 4);
+    assert_eq!(app.state().inventory.status("MILK"), StockStatus::Low);
+    assert_eq!(
+        app.state().inventory.status("BREAD"),
+        StockStatus::Untracked
+    );
+    // Home is refused with a sale open.
+    rig.scan(&mut app, "96385074");
+    rig.key(&mut app, Key::Home, 100_000);
+    assert!(matches!(app.screen(), Screen::Sale));
+    rig.key(&mut app, Key::F(4), 100_000); // manager may void the line
+    assert!(app.cart().is_empty(), "{:?}", app.message());
+
+    // Refund 2 milk: back on the shelf.
+    rig.key(&mut app, Key::F(9), 100_000);
+    rig.typ(&mut app, "1\n\n2\n");
+    rig.key(&mut app, Key::F(1), 100_000);
+    rig.typ(&mut app, "Wrong size\n1\n");
+    assert_eq!(on_hand(&app, "MILK"), 6, "{:?}", app.message());
+
+    // Write off 1 (expired), then count 10.
+    rig.key(&mut app, Key::Home, 100_000);
+    rig.key(&mut app, Key::Char('2'), 100_000);
+    rig.typ(&mut app, "milk\n");
+    rig.key(&mut app, Key::F(3), 100_000);
+    rig.typ(&mut app, "1\n2\n");
+    assert_eq!(on_hand(&app, "MILK"), 5, "{:?}", app.message());
+    rig.key(&mut app, Key::F(2), 100_000);
+    rig.typ(&mut app, "10\n");
+    assert_eq!(on_hand(&app, "MILK"), 10);
+    assert!(matches!(
+        app.state().inventory.get("MILK"),
+        Some(l) if l.last_counted > 0
+    ));
+
+    // STOCK.CSV from the list.
+    rig.key(&mut app, Key::Escape, 100_000);
+    rig.key(&mut app, Key::Escape, 100_000); // clear the search
+    rig.key(&mut app, Key::F(6), 100_000);
+    let csv = String::from_utf8(rig.media.0["STOCK.CSV"].clone()).unwrap();
+    assert!(
+        csv.contains("MILK,\"Milk 1L\",In stock,10,5,0.80,12.00"),
+        "{csv}"
+    );
+    assert!(csv.contains("BREAD,\"Bread\",Not tracked,,,,"), "{csv}");
+
+    // A cashier needs a manager to receive stock.
+    rig.key(&mut app, Key::Home, 100_000);
+    rig.key(&mut app, Key::F(12), 100_000);
+    rig.shot(&app, "i4_lock");
+    rig.typ(&mut app, "2\n");
+    rig.shot(&app, "i5_pin");
+    rig.typ(&mut app, "0000\n");
+    rig.key(&mut app, Key::Char('2'), 100_000);
+    rig.typ(&mut app, "milk\n");
+    rig.key(&mut app, Key::F(1), 100_000);
+    rig.typ(&mut app, "5\n\n");
+    assert!(
+        matches!(app.screen(), Screen::Prompt(_)),
+        "{:?}",
+        app.screen()
+    );
+    rig.typ(&mut app, "1\n1234\n");
+    assert_eq!(on_hand(&app, "MILK"), 15, "{:?}", app.message());
+
+    // Everything survives a reboot (journal replay, and a snapshot).
+    let before = app.state().clone();
+    let dev = app.into_device().unwrap();
+    let (app2, st) = boot(dev);
+    assert_eq!(st, BootStatus::Ready);
+    assert_eq!(app2.state(), &before);
+}
+
+/// Inventory and the home screen by touch alone.
+#[test]
+fn inventory_by_touch() {
+    let mut rig = Rig::new();
+    let (mut app, _) = boot(fresh_device());
+    bring_up(&mut rig, &mut app);
+    rig.tap(&mut app, "Home");
+    rig.tap(&mut app, "Inventory");
+    rig.tap(&mut app, "Milk 1L");
+    rig.tap(&mut app, "Receive");
+    rig.taps(&mut app, &["1", "2", "OK", "OK"]);
+    assert_eq!(on_hand(&app, "MILK"), 12, "{:?}", app.message());
+    rig.tap(&mut app, "Write off");
+    rig.taps(&mut app, &["2", "OK", "Damaged"]);
+    assert_eq!(on_hand(&app, "MILK"), 10, "{:?}", app.message());
+    rig.tap(&mut app, "Back");
+    rig.tap(&mut app, "Not tracked");
+    assert!(app.tap_targets().iter().all(|(_, l)| l != "Milk 1L"));
+    rig.tap(&mut app, "Home");
+    rig.tap(&mut app, "Sign out");
+    assert!(matches!(app.screen(), Screen::Prompt(_)));
 }

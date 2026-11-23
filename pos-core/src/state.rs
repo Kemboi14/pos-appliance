@@ -13,6 +13,8 @@ use crate::auth::{
 use crate::cart::{Cart, CartError};
 use crate::catalog::{Catalog, CatalogError, Item};
 use crate::config::Config;
+use crate::inventory::{Adjust, Inventory, Received};
+use crate::media::{Picture, PictureFor, Pictures};
 use crate::money::{Money, MoneyError, Qty};
 use crate::sale::{Refund, RefundLine, Refundable, RefundableLine, Sale, SoldLine};
 use crate::shift::{Counters, Report, ReportKind, Shift};
@@ -120,6 +122,42 @@ pub enum Event {
         by: UserId,
         at: i64,
     },
+    /// A delivery: stock added, optionally with unit costs.
+    StockReceived {
+        by: UserId,
+        at: i64,
+        supplier: String,
+        lines: Vec<Received>,
+    },
+    /// A shelf count replaces the book quantity; `variance` is counted − book.
+    StockCounted {
+        by: UserId,
+        at: i64,
+        sku: String,
+        counted: Qty,
+        variance: Qty,
+    },
+    /// Stock removed other than by a sale (`qty` > 0 is removed).
+    StockWrittenOff {
+        by: UserId,
+        at: i64,
+        sku: String,
+        qty: Qty,
+        reason: Adjust,
+    },
+    ReorderLevelSet {
+        by: UserId,
+        at: i64,
+        sku: String,
+        level: Qty,
+    },
+    /// Attach (or with `None`, remove) a picture.
+    PictureSet {
+        by: UserId,
+        at: i64,
+        target: PictureFor,
+        picture: Option<Picture>,
+    },
 }
 
 impl Event {
@@ -141,7 +179,12 @@ impl Event {
             | Event::NoSale { at, .. }
             | Event::Reprint { at, .. }
             | Event::Exported { at, .. }
-            | Event::StoreAdopted { at, .. } => *at,
+            | Event::StoreAdopted { at, .. }
+            | Event::StockReceived { at, .. }
+            | Event::StockCounted { at, .. }
+            | Event::StockWrittenOff { at, .. }
+            | Event::ReorderLevelSet { at, .. }
+            | Event::PictureSet { at, .. } => *at,
             Event::SaleCompleted(s) => s.at,
             Event::RefundCompleted(r) => r.at,
             Event::Report(r) => r.at,
@@ -172,6 +215,11 @@ impl Event {
             Event::Report(_) => "X_REPORT",
             Event::Exported { .. } => "EXPORT",
             Event::StoreAdopted { .. } => "ADOPT",
+            Event::StockReceived { .. } => "STOCK_IN",
+            Event::StockCounted { .. } => "STOCK_COUNT",
+            Event::StockWrittenOff { .. } => "STOCK_OUT",
+            Event::ReorderLevelSet { .. } => "REORDER",
+            Event::PictureSet { .. } => "PICTURE",
         }
     }
 }
@@ -201,6 +249,7 @@ pub enum DomainError {
     EmptyRefund,
     SetupDone,
     LastManager,
+    Stock(&'static str),
 }
 
 impl From<MoneyError> for DomainError {
@@ -242,6 +291,51 @@ pub struct PosState {
     /// Number of events applied (sanity check against the journal).
     pub events: u64,
     pub last_event_at: i64,
+    pub inventory: Inventory,
+    pub pictures: Pictures,
+}
+
+/// Snapshot layout before inventory and pictures (decoded for upgrade).
+#[derive(Deserialize)]
+struct PosStateV1 {
+    config: Config,
+    catalog: Catalog,
+    users: BTreeMap<UserId, User>,
+    locks: BTreeMap<UserId, LockState>,
+    shift: Option<Shift>,
+    next_receipt: u64,
+    next_z: u32,
+    next_shift: u32,
+    grand_total: Money,
+    refundable: BTreeMap<u64, Refundable>,
+    events: u64,
+    last_event_at: i64,
+}
+
+impl PosState {
+    /// Decode a snapshot written by this or an earlier version.
+    pub fn from_snapshot(b: &[u8]) -> Option<PosState> {
+        if let Ok(s) = postcard::from_bytes::<PosState>(b) {
+            return Some(s);
+        }
+        let v: PosStateV1 = postcard::from_bytes(b).ok()?;
+        Some(PosState {
+            config: v.config,
+            catalog: v.catalog,
+            users: v.users,
+            locks: v.locks,
+            shift: v.shift,
+            next_receipt: v.next_receipt,
+            next_z: v.next_z,
+            next_shift: v.next_shift,
+            grand_total: v.grand_total,
+            refundable: v.refundable,
+            events: v.events,
+            last_event_at: v.last_event_at,
+            inventory: Inventory::default(),
+            pictures: Pictures::default(),
+        })
+    }
 }
 
 impl Default for PosState {
@@ -259,6 +353,8 @@ impl Default for PosState {
             refundable: BTreeMap::new(),
             events: 0,
             last_event_at: 0,
+            inventory: Inventory::default(),
+            pictures: Pictures::default(),
         }
     }
 }
@@ -584,11 +680,24 @@ impl PosState {
             Event::CatalogDelete { by, sku, .. } => {
                 self.require(*by, Permission::ManageCatalog)?;
                 self.catalog.remove(sku).ok_or(CatalogError::NotFound)?;
+                self.inventory.forget(sku);
+                self.pictures.retain_items(|s| s != sku);
             }
             Event::CatalogReplace { by, items, .. } => {
                 self.require(*by, Permission::Import)?;
                 self.catalog = Catalog::from_items(items, &self.config)
                     .map_err(|(_, e)| DomainError::Catalog(e))?;
+                let gone: Vec<String> = self
+                    .inventory
+                    .levels()
+                    .map(|(s, _)| s.clone())
+                    .filter(|s| self.catalog.get(s).is_none())
+                    .collect();
+                for s in &gone {
+                    self.inventory.forget(s);
+                }
+                let cat = &self.catalog;
+                self.pictures.retain_items(|s| cat.get(s).is_some());
             }
             Event::ShiftOpened {
                 shift_id,
@@ -660,8 +769,91 @@ impl PosState {
             Event::StoreAdopted { by, .. } => {
                 self.require(*by, Permission::Configure)?;
             }
+            Event::StockReceived { by, at, lines, .. } => {
+                self.require(*by, Permission::Stock)?;
+                if lines.is_empty() {
+                    return Err(DomainError::Stock("empty delivery"));
+                }
+                for l in lines {
+                    self.stock_sku(&l.sku)?;
+                    if !crate::inventory::valid_qty(l.qty)
+                        || l.unit_cost.is_some_and(|c| c.is_negative())
+                    {
+                        return Err(DomainError::Stock("bad quantity or cost"));
+                    }
+                }
+                self.inventory.receive(lines, *at);
+            }
+            Event::StockCounted {
+                by,
+                at,
+                sku,
+                counted,
+                variance,
+            } => {
+                self.require(*by, Permission::Stock)?;
+                self.stock_sku(sku)?;
+                if counted.0 < 0 || counted.0 > 1_000_000_000 {
+                    return Err(DomainError::Stock("bad quantity"));
+                }
+                if self.inventory.count(sku, *counted, *at) != *variance {
+                    return Err(DomainError::Stock("variance mismatch"));
+                }
+            }
+            Event::StockWrittenOff { by, sku, qty, .. } => {
+                self.require(*by, Permission::Stock)?;
+                self.stock_sku(sku)?;
+                if !crate::inventory::valid_qty(*qty) {
+                    return Err(DomainError::Stock("bad quantity"));
+                }
+                self.inventory.adjust(sku, Qty(-qty.0));
+            }
+            Event::ReorderLevelSet { by, sku, level, .. } => {
+                self.require(*by, Permission::Stock)?;
+                self.stock_sku(sku)?;
+                if level.0 < 0 || level.0 > 1_000_000_000 {
+                    return Err(DomainError::Stock("bad quantity"));
+                }
+                self.inventory.set_reorder(sku, *level);
+            }
+            Event::PictureSet {
+                by,
+                target,
+                picture,
+                ..
+            } => {
+                let perm = match target {
+                    PictureFor::Item(_) => Permission::ManageCatalog,
+                    PictureFor::User(_) => Permission::ManageUsers,
+                    PictureFor::Logo | PictureFor::Wallpaper => Permission::Configure,
+                };
+                self.require(*by, perm)?;
+                match target {
+                    PictureFor::Item(s) => {
+                        self.stock_sku(s)?;
+                    }
+                    PictureFor::User(u) => {
+                        self.user(*u)?;
+                    }
+                    _ => {}
+                }
+                if picture
+                    .as_ref()
+                    .is_some_and(|p| !Pictures::valid(target, p))
+                {
+                    return Err(DomainError::Stock("bad picture"));
+                }
+                self.pictures.set(target.clone(), picture.clone());
+            }
         }
         Ok(())
+    }
+
+    fn stock_sku(&self, sku: &str) -> DResult<()> {
+        self.catalog
+            .get(sku)
+            .map(|_| ())
+            .ok_or(DomainError::Catalog(CatalogError::NotFound))
     }
 
     fn shift_mut(&mut self) -> DResult<&mut Shift> {
@@ -705,6 +897,9 @@ impl PosState {
         let collected = s.totals.total;
         let shift = self.shift_mut()?;
         shift.counters.add_sale(s)?;
+        for l in &s.lines {
+            self.inventory.sold(&l.line.sku, l.line.qty);
+        }
         self.grand_total = self.grand_total.checked_add(collected)?;
         self.next_receipt += 1;
         self.refundable.insert(
@@ -780,6 +975,9 @@ impl PosState {
         }
         self.refundable.insert(r.original_receipt, rf);
         self.shift_mut()?.counters.add_refund(r)?;
+        for l in &r.lines {
+            self.inventory.returned(&l.sku, l.qty);
+        }
         self.grand_total = self.grand_total.checked_sub(r.total)?;
         self.next_receipt += 1;
         Ok(())
@@ -806,5 +1004,27 @@ impl PosState {
             self.shift = None;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    /// A snapshot written before inventory and pictures existed still loads.
+    #[test]
+    fn v1_snapshot_upgrades() {
+        let mut st = PosState {
+            next_receipt: 42,
+            ..PosState::default()
+        };
+        st.config.store_name = "Old store".into();
+        let new = postcard::to_allocvec(&st).unwrap();
+        // The two new fields are empty maps: one length byte each.
+        let old = &new[..new.len() - 2];
+        assert!(postcard::from_bytes::<PosState>(old).is_err());
+        assert_eq!(PosState::from_snapshot(old), Some(st.clone()));
+        assert_eq!(PosState::from_snapshot(&new), Some(st));
+        assert_eq!(PosState::from_snapshot(&[1, 2, 3]), None);
     }
 }

@@ -644,6 +644,10 @@ fn smoke(f: &Flags) -> Res<()> {
 const UI_PANEL: u32 = 0x0022_2A35;
 const UI_BG: u32 = 0x0016_1B22;
 
+fn desktop_wall(w: usize, h: usize) -> pos_ui::image::Bitmap {
+    pos_ui::image::default_wallpaper(w as i32, h as i32)
+}
+
 fn wait_ui(q: &mut qemu::Qmp, out: &Path, timeout: Duration) -> Res<(usize, usize)> {
     let shot = out.join("ui.ppm");
     let deadline = std::time::Instant::now() + timeout;
@@ -654,6 +658,15 @@ fn wait_ui(q: &mut qemu::Qmp, out: &Path, timeout: Duration) -> Res<(usize, usiz
         if let Ok(img) = qemu::read_ppm(&shot) {
             let (w, h) = (img.0, img.1);
             if qemu::pixel(&img, 2, 2) == UI_PANEL && qemu::pixel(&img, 2, h / 2) == UI_BG {
+                return Ok((w, h));
+            }
+            // Sign-in / home screens: the built-in wallpaper at the left edge.
+            let wall = desktop_wall(w, h);
+            let probe = |y: usize| (wall.px[y * w + 2] & 0x00FF_FFFF, qemu::pixel(&img, 2, y));
+            if [h / 2, h * 3 / 4, h - 3].iter().all(|&y| {
+                let (want, got) = probe(y);
+                want == got
+            }) {
                 return Ok((w, h));
             }
         }
@@ -815,7 +828,9 @@ fn e2e(kernel: bool, hub: bool) -> Res<()> {
         q.type_str("1\n", human)?;
         q.type_str("1234\n", human)?;
         pause(1500);
-        q.screendump(&out.join("e2e_0_login.ppm"))?;
+        q.screendump(&out.join("e2e_0_home.ppm"))?;
+        q.type_str("\n", human)?; // open the Till app
+        pause(300);
         q.type_str("100.00\n", human)?;
         pause(500);
         if kernel {

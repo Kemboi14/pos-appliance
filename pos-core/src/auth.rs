@@ -33,6 +33,8 @@ pub enum Permission {
     Import,
     Configure,
     UnlockUser,
+    /// Receive deliveries, count and write off stock, set reorder levels.
+    Stock,
 }
 
 impl Permission {
@@ -55,6 +57,7 @@ impl Permission {
             Permission::Import => "import",
             Permission::Configure => "configure",
             Permission::UnlockUser => "unlock user",
+            Permission::Stock => "stock changes",
         }
     }
 }

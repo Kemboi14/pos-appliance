@@ -189,7 +189,9 @@ impl fmt::Display for Rate {
 
 /// Quantity in thousandths of a unit (grams for kg-priced items; 1000 = one
 /// piece for counted items).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct Qty(pub i64);
 
 impl Qty {

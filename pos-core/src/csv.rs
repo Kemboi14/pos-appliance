@@ -453,6 +453,71 @@ pub fn journal_row(seq: u64, hash_hex: &str, e: &Event, cfg: &Config) -> String 
             String::new(),
             alloc::format!("{what} bytes={bytes}"),
         ),
+        Event::StockReceived {
+            by,
+            supplier,
+            lines,
+            ..
+        } => (
+            String::new(),
+            by.to_string(),
+            String::new(),
+            alloc::format!(
+                "supplier={supplier} {}",
+                lines
+                    .iter()
+                    .map(|l| alloc::format!("{}+{}", l.sku, l.qty))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        ),
+        Event::StockCounted {
+            by,
+            sku,
+            counted,
+            variance,
+            ..
+        } => (
+            String::new(),
+            by.to_string(),
+            String::new(),
+            alloc::format!("sku={sku} counted={counted} variance={variance}"),
+        ),
+        Event::StockWrittenOff {
+            by,
+            sku,
+            qty,
+            reason,
+            ..
+        } => (
+            String::new(),
+            by.to_string(),
+            String::new(),
+            alloc::format!("sku={sku} qty={qty} reason={}", reason.label()),
+        ),
+        Event::ReorderLevelSet { by, sku, level, .. } => (
+            String::new(),
+            by.to_string(),
+            String::new(),
+            alloc::format!("sku={sku} level={level}"),
+        ),
+        Event::PictureSet {
+            by,
+            target,
+            picture,
+            ..
+        } => (
+            String::new(),
+            by.to_string(),
+            String::new(),
+            alloc::format!(
+                "{target:?} {}",
+                picture
+                    .as_ref()
+                    .map(|p| alloc::format!("{}x{} {}B", p.w, p.h, p.data.len()))
+                    .unwrap_or_else(|| "removed".into())
+            ),
+        ),
     };
     alloc::format!(
         "{},{},{},{},{},{},{},{}\r\n",
