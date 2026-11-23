@@ -2,29 +2,26 @@
 //!
 //! * [`Canvas`]: RGB888 back buffer with dirty-rectangle tracking; only the
 //!   changed region is blitted to the display on [`Canvas::present`].
-//! * Text: X11 "misc-fixed" bitmap fonts (public domain) from
-//!   embedded-graphics, ISO 8859-1 for Latin-1, ISO 8859-15 for `€`, plus a
-//!   few hand-drawn currency glyphs (₹ ₦ ₱ ₽ ₺ ₩) in [`glyphs`].
-//! * [`Ui`]: per-frame widget helpers (buttons that report pointer clicks).
+//! * Text: anti-aliased DejaVu Sans (regular and bold), embedded and
+//!   subset, see [`text`]. Sizes follow the screen: the baseline design is
+//!   1024×768 and every size and spacing scales by the canvas
+//!   [`zoom`](Canvas::zoom) (e.g. ×1.41 at 1920×1080).
+//! * [`Ui`]: per-frame widget helpers. Buttons light up while pressed and
+//!   report a click only when the press and the release both land on them.
 //! * [`scan::ScanDetector`]: keyboard-wedge barcode scanner detection.
-//!
-//! Layout is computed from the actual screen size; the baseline design is
-//! 1024×768 and everything scales by integer factors above that.
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
-pub mod glyphs;
 pub mod scan;
+mod text;
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use embedded_graphics::mono_font::{MonoFont, MonoTextStyle, iso_8859_1, iso_8859_15};
-use embedded_graphics::pixelcolor::Rgb888 as EgRgb;
-use embedded_graphics::prelude::*;
-use embedded_graphics::text::{Baseline, Text};
 use pos_hal::{Display, HalResult, Rgb888};
+use text::{Face, Fonts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rect {
@@ -57,6 +54,13 @@ impl Rect {
             Rect::new(self.x + w, self.y, self.w - w, self.h),
         )
     }
+    pub fn split_right(&self, w: i32) -> (Rect, Rect) {
+        let w = w.clamp(0, self.w);
+        (
+            Rect::new(self.x, self.y, self.w - w, self.h),
+            Rect::new(self.x + self.w - w, self.y, w, self.h),
+        )
+    }
     pub fn split_top(&self, h: i32) -> (Rect, Rect) {
         let h = h.clamp(0, self.h);
         (
@@ -71,7 +75,13 @@ impl Rect {
             Rect::new(self.x, self.y + self.h - h, self.w, h),
         )
     }
-    /// `n` equal cells in a `cols`-column grid, with `gap` between them.
+    /// Centred sub-rectangle of at most `w`×`h`.
+    pub fn centered(&self, w: i32, h: i32) -> Rect {
+        let w = w.min(self.w);
+        let h = h.min(self.h);
+        Rect::new(self.x + (self.w - w) / 2, self.y + (self.h - h) / 2, w, h)
+    }
+    /// `cols`×`rows` equal cells, row by row, with `gap` between them.
     pub fn grid(&self, cols: i32, rows: i32, gap: i32) -> Vec<Rect> {
         let cw = (self.w - gap * (cols - 1)) / cols.max(1);
         let ch = (self.h - gap * (rows - 1)) / rows.max(1);
@@ -88,6 +98,12 @@ impl Rect {
         }
         v
     }
+    /// Cell spanning `span` columns starting at `cell` in a row of `cells`.
+    pub fn span(cells: &[Rect], first: usize, span: usize) -> Rect {
+        let a = cells[first];
+        let b = cells[first + span - 1];
+        a.union(&b)
+    }
     fn union(&self, o: &Rect) -> Rect {
         let x0 = self.x.min(o.x);
         let y0 = self.y.min(o.y);
@@ -97,31 +113,45 @@ impl Rect {
     }
 }
 
+/// Text styles. Pixel sizes are for the 1024×768 baseline and scale with
+/// the canvas zoom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Font {
-    /// 6×13
+    /// 14 px regular (hints, secondary text)
     Small,
-    /// 10×20
+    /// 19 px regular (body text, lists)
     Normal,
-    /// 10×20 at 2× (totals, big numbers)
+    /// 19 px bold (buttons, emphasis)
+    Bold,
+    /// 32 px bold (titles, totals)
     Large,
+    /// 60 px bold (change due)
+    Huge,
 }
 
 impl Font {
-    fn mono(self) -> (&'static MonoFont<'static>, &'static MonoFont<'static>, i32) {
-        match self {
-            Font::Small => (&iso_8859_1::FONT_6X13, &iso_8859_15::FONT_6X13, 1),
-            Font::Normal => (&iso_8859_1::FONT_10X20, &iso_8859_15::FONT_10X20, 1),
-            Font::Large => (&iso_8859_1::FONT_10X20, &iso_8859_15::FONT_10X20, 2),
+    /// Largest to smallest, for fitting labels.
+    pub const FIT_ORDER: [Font; 4] = [Font::Large, Font::Bold, Font::Normal, Font::Small];
+
+    /// At most [`Font::Bold`] (Large is for single short labels).
+    pub fn min_bold(self) -> Font {
+        if self == Font::Large {
+            Font::Bold
+        } else {
+            self
         }
     }
-    /// Cell size in pixels at UI scale 1.
-    pub fn cell(self) -> (i32, i32) {
-        let (f, _, s) = self.mono();
-        (
-            f.character_size.width as i32 * s,
-            f.character_size.height as i32 * s,
-        )
+
+    fn base_px(self) -> i32 {
+        match self {
+            Font::Small => 14,
+            Font::Normal | Font::Bold => 19,
+            Font::Large => 32,
+            Font::Huge => 60,
+        }
+    }
+    fn bold(self) -> bool {
+        matches!(self, Font::Bold | Font::Large | Font::Huge)
     }
 }
 
@@ -132,58 +162,31 @@ pub struct Canvas {
     h: i32,
     px: Vec<Rgb888>,
     dirty: Option<Rect>,
-    /// Integer UI scale (1 at ≤ 1920×1080).
-    pub scale: i32,
+    zoom: i32,
+    fonts: Fonts,
+    /// Progress through [`WARM`] (glyphs rasterised ahead of use).
+    warm_pos: usize,
 }
 
-/// Drawing target that scales each pixel to an s×s block, used for text.
-struct Scaled<'a> {
-    c: &'a mut Canvas,
-    ox: i32,
-    oy: i32,
-    s: i32,
-}
-
-impl OriginDimensions for Scaled<'_> {
-    fn size(&self) -> Size {
-        Size::new(self.c.w as u32, self.c.h as u32)
-    }
-}
-
-impl DrawTarget for Scaled<'_> {
-    type Color = EgRgb;
-    type Error = core::convert::Infallible;
-    fn draw_iter<I: IntoIterator<Item = Pixel<EgRgb>>>(
-        &mut self,
-        pixels: I,
-    ) -> Result<(), Self::Error> {
-        for Pixel(p, c) in pixels {
-            let v = (u32::from(c.r()) << 16) | (u32::from(c.g()) << 8) | u32::from(c.b());
-            let x = self.ox + p.x * self.s;
-            let y = self.oy + p.y * self.s;
-            for dy in 0..self.s {
-                for dx in 0..self.s {
-                    self.c.put(x + dx, y + dy, v);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-fn eg(c: Rgb888) -> EgRgb {
-    EgRgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8)
-}
+/// Glyphs to rasterise ahead of first use, per font: printable ASCII and
+/// the symbols the screens draw. [`Font::Huge`] only shows amounts.
+const WARM_FONTS: [Font; 4] = [Font::Normal, Font::Bold, Font::Large, Font::Small];
+const WARM_SYMBOLS: &str = "€£¥₹₦₱₽₺₩…←→⇧⌫◀▶✓✕•×›−";
+const WARM_HUGE: &str = "0123456789.,−-";
 
 impl Canvas {
     pub fn new(w: u32, h: u32) -> Canvas {
-        let scale = ((w / 1024).min(h / 768)).max(1) as i32;
+        // Per-mille scale against the 1024×768 design, kept within reason
+        // for small panels and 4K.
+        let zoom = ((w as i32 * 1000 / 1024).min(h as i32 * 1000 / 768)).clamp(700, 4000);
         Canvas {
             w: w as i32,
             h: h as i32,
             px: vec![0; (w * h) as usize],
             dirty: Some(Rect::new(0, 0, w as i32, h as i32)),
-            scale,
+            zoom,
+            fonts: Fonts::new(),
+            warm_pos: 0,
         }
     }
     pub fn width(&self) -> i32 {
@@ -195,15 +198,25 @@ impl Canvas {
     pub fn bounds(&self) -> Rect {
         Rect::new(0, 0, self.w, self.h)
     }
+    /// Scale against the 1024×768 design, in thousandths.
+    pub fn zoom(&self) -> i32 {
+        self.zoom
+    }
+    /// A baseline length (pixels at 1024×768) at this canvas's zoom.
+    pub fn px(&self, base: i32) -> i32 {
+        (base * self.zoom + 500) / 1000
+    }
     pub fn pixel(&self, x: i32, y: i32) -> Option<Rgb888> {
         (x >= 0 && y >= 0 && x < self.w && y < self.h).then(|| self.px[(y * self.w + x) as usize])
     }
 
     #[inline]
-    fn put(&mut self, x: i32, y: i32, c: Rgb888) {
-        if x >= 0 && y >= 0 && x < self.w && y < self.h {
-            self.px[(y * self.w + x) as usize] = c;
+    fn blend(&mut self, x: i32, y: i32, c: Rgb888, a: u8) {
+        if a == 0 || x < 0 || y < 0 || x >= self.w || y >= self.h {
+            return;
         }
+        let i = (y * self.w + x) as usize;
+        self.px[i] = mix(self.px[i], c, a);
     }
 
     fn mark(&mut self, r: Rect) {
@@ -229,6 +242,38 @@ impl Canvas {
         self.mark(r);
     }
 
+    /// Filled rectangle with corners of radius `rad` (edge pixels blended).
+    pub fn fill_round_rect(&mut self, r: Rect, rad: i32, c: Rgb888) {
+        let rad = rad.min(r.w / 2).min(r.h / 2).max(0);
+        if rad == 0 {
+            self.fill_rect(r, c);
+            return;
+        }
+        self.fill_rect(Rect::new(r.x, r.y + rad, r.w, r.h - 2 * rad), c);
+        // Corner rows: integer circle with a one-pixel blended edge.
+        let r2 = rad * rad;
+        for dy in 0..rad {
+            let yy = rad - dy; // distance from the arc centre, ≥ 1
+            let mut inset = rad;
+            while inset > 0 && (rad - inset + 1) * (rad - inset + 1) + yy * yy <= r2 + rad {
+                inset -= 1;
+            }
+            // inset = first column (from the edge) fully inside.
+            let top = r.y + dy;
+            let bot = r.y + r.h - 1 - dy;
+            self.fill_rect(Rect::new(r.x + inset, top, r.w - 2 * inset, 1), c);
+            self.fill_rect(Rect::new(r.x + inset, bot, r.w - 2 * inset, 1), c);
+            if inset > 0 {
+                let xa = r.x + inset - 1;
+                let xb = r.x + r.w - inset;
+                for (x, y) in [(xa, top), (xb, top), (xa, bot), (xb, bot)] {
+                    self.blend(x, y, c, 128);
+                }
+            }
+        }
+        self.mark(r);
+    }
+
     pub fn frame_rect(&mut self, r: Rect, t: i32, c: Rgb888) {
         self.fill_rect(Rect::new(r.x, r.y, r.w, t), c);
         self.fill_rect(Rect::new(r.x, r.y + r.h - t, r.w, t), c);
@@ -236,98 +281,189 @@ impl Canvas {
         self.fill_rect(Rect::new(r.x + r.w - t, r.y, t, r.h), c);
     }
 
+    fn face(&self, font: Font) -> Face {
+        Face {
+            bold: font.bold(),
+            px: self.px(font.base_px()).clamp(6, 400) as u16,
+        }
+    }
+
     /// Width in pixels of `s` in `font`.
     pub fn text_width(&self, s: &str, font: Font) -> i32 {
-        font.cell().0 * self.scale * s.chars().count() as i32
+        self.fonts.width(self.face(font), s)
     }
+    /// Height of one line of `font` (ascent + descent).
     pub fn line_height(&self, font: Font) -> i32 {
-        font.cell().1 * self.scale
+        self.fonts.metrics(self.face(font)).height
     }
 
     /// Draw `s` with its top-left at (x, y). Returns the advance width.
     pub fn text(&mut self, x: i32, y: i32, s: &str, font: Font, c: Rgb888) -> i32 {
-        let (latin1, latin9, fs) = font.mono();
-        let s_total = fs * self.scale;
-        let (cw, ch) = font.cell();
-        let (cw, ch) = (cw * self.scale, ch * self.scale);
-        let mut cx = x;
-        let mut buf = [0u8; 4];
-        for chr in s.chars() {
-            let mono = if u32::from(chr) < 0x100 {
-                Some(latin1)
-            } else if matches!(chr, '€' | 'Š' | 'š' | 'Ž' | 'ž' | 'Œ' | 'œ' | 'Ÿ') {
-                Some(latin9)
-            } else {
-                None
+        let face = self.face(font);
+        let m = self.fonts.metrics(face);
+        let base = y + m.ascent;
+        let mut pen = x;
+        // Disjoint borrows: read glyphs from the cache, write pixels.
+        let (cw, chh) = (self.w, self.h);
+        let Canvas { fonts, px, .. } = self;
+        for ch in s.chars() {
+            let Some(g) = fonts.glyph(face, ch) else {
+                continue;
             };
-            match mono {
-                Some(m) => {
-                    let style = MonoTextStyle::new(m, eg(c));
-                    let mut t = Scaled {
-                        c: self,
-                        ox: cx,
-                        oy: y,
-                        s: s_total,
-                    };
-                    let _ = Text::with_baseline(
-                        chr.encode_utf8(&mut buf),
-                        Point::zero(),
-                        style,
-                        Baseline::Top,
-                    )
-                    .draw(&mut t);
-                }
-                None => {
-                    let g = glyphs::glyph(chr);
-                    // Hand-drawn glyphs are 10×20; scale to the font cell.
-                    for (row, bits) in g.iter().enumerate() {
-                        for col in 0..10 {
-                            if bits & (1 << (9 - col)) != 0 {
-                                let x0 = cx + col * cw / 10;
-                                let x1 = cx + (col + 1) * cw / 10;
-                                let y0 = y + row as i32 * ch / 20;
-                                let y1 = y + (row as i32 + 1) * ch / 20;
-                                for yy in y0..y1.max(y0 + 1) {
-                                    for xx in x0..x1.max(x0 + 1) {
-                                        self.put(xx, yy, c);
-                                    }
-                                }
-                            }
-                        }
+            let (gx0, gy0) = (pen + g.left, base + g.top);
+            // Clip the glyph box to the canvas once, then blend rows.
+            let xa = (-gx0).max(0);
+            let xb = g.w.min(cw - gx0);
+            let ya = (-gy0).max(0);
+            let yb = g.h.min(chh - gy0);
+            for gy in ya..yb {
+                let row = ((gy0 + gy) * cw) as usize;
+                let src = (gy * g.w) as usize;
+                for gx in xa..xb {
+                    let a = g.cov[src + gx as usize];
+                    if a != 0 {
+                        let i = row + (gx0 + gx) as usize;
+                        px[i] = mix(px[i], c, a);
                     }
                 }
             }
-            cx += cw;
+            pen += g.adv;
         }
-        self.mark(Rect::new(x, y, cx - x, ch));
-        cx - x
+        self.mark(Rect::new(x, y, pen - x + 2, m.height));
+        pen - x
+    }
+
+    /// `s` cut to fit in `w` pixels, ending in `…` if it had to be cut.
+    pub fn fit(&self, s: &str, font: Font, w: i32) -> String {
+        if self.text_width(s, font) <= w {
+            return s.into();
+        }
+        let ell = self.text_width("…", font);
+        let mut out = String::new();
+        let mut used = 0;
+        for ch in s.chars() {
+            let a = self.text_width(ch.encode_utf8(&mut [0; 4]), font);
+            if used + a + ell > w {
+                break;
+            }
+            used += a;
+            out.push(ch);
+        }
+        out.push('…');
+        out
     }
 
     /// Text aligned within `r`: `align` 0 = left, 1 = centre, 2 = right;
-    /// vertically centred. Truncated with `~` if it does not fit (the fonts have no `…`).
+    /// vertically centred. Cut with `…` if it does not fit.
     pub fn text_in(&mut self, r: Rect, s: &str, font: Font, c: Rgb888, align: u8) {
-        let (cw, ch) = font.cell();
-        let cw = cw * self.scale;
-        let ch = ch * self.scale;
-        let max_chars = (r.w / cw.max(1)).max(0) as usize;
-        let n = s.chars().count();
-        let shown: alloc::string::String = if n > max_chars && max_chars > 0 {
-            s.chars()
-                .take(max_chars - 1)
-                // '…' is not in the Latin-1/-15 fonts; '~' is.
-                .chain(core::iter::once('~'))
-                .collect()
-        } else {
-            s.into()
-        };
-        let w = cw * shown.chars().count() as i32;
+        let shown = self.fit(s, font, r.w);
+        let w = self.text_width(&shown, font);
+        let h = self.line_height(font);
         let x = match align {
             0 => r.x,
             1 => r.x + (r.w - w) / 2,
             _ => r.x + r.w - w,
         };
-        let y = r.y + (r.h - ch) / 2;
+        let y = r.y + (r.h - h) / 2;
         self.text(x, y, &shown, font, c);
+    }
+
+    /// Word-wrap `s` to lines no wider than `w`. A word longer than a line
+    /// is broken between characters.
+    pub fn wrap(&self, s: &str, font: Font, w: i32) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for word in s.split_whitespace() {
+            let cand = if cur.is_empty() {
+                String::from(word)
+            } else {
+                alloc::format!("{cur} {word}")
+            };
+            if self.text_width(&cand, font) <= w {
+                cur = cand;
+                continue;
+            }
+            if !cur.is_empty() {
+                lines.push(core::mem::take(&mut cur));
+            }
+            // Break over-long words.
+            for ch in word.chars() {
+                let mut next = cur.clone();
+                next.push(ch);
+                if !cur.is_empty() && self.text_width(&next, font) > w {
+                    lines.push(core::mem::take(&mut cur));
+                    cur.push(ch);
+                } else {
+                    cur = next;
+                }
+            }
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+        lines
+    }
+
+    /// Does `s` fit in `r` within `max_lines` wrapped lines?
+    pub fn fits(&self, s: &str, font: Font, r: Rect, max_lines: usize) -> bool {
+        let lines = self.wrap(s, font, r.w);
+        lines.len() <= max_lines
+            && lines.len() as i32 * self.line_height(font) <= r.h
+            && lines.iter().all(|l| self.text_width(l, font) <= r.w)
+    }
+
+    /// Wrapped, centred text in `r`; lines that do not fit are dropped and
+    /// the last shown line ends in `…`.
+    pub fn text_wrapped(&mut self, r: Rect, s: &str, font: Font, c: Rgb888) {
+        let lh = self.line_height(font);
+        let max = (r.h / lh.max(1)).max(1) as usize;
+        let mut lines = self.wrap(s, font, r.w);
+        if lines.len() > max {
+            lines.truncate(max);
+            if let Some(last) = lines.last_mut() {
+                let cut = alloc::format!("{last}…");
+                *last = self.fit(&cut, font, r.w);
+                if !last.ends_with('…') {
+                    last.push('…');
+                }
+            }
+        }
+        let total = lines.len() as i32 * lh;
+        let mut y = r.y + (r.h - total) / 2;
+        for l in &lines {
+            self.text_in(Rect::new(r.x, y, r.w, lh), l, font, c, 1);
+            y += lh;
+        }
+    }
+
+    /// Rasterise up to `budget` glyphs that are likely to be drawn soon, so
+    /// a screen's first appearance does not stall on outline rendering
+    /// (slow where floating point is emulated in software, as on both
+    /// tiers' targets). Returns false once everything is cached.
+    pub fn warm(&mut self, budget: usize) -> bool {
+        let per_font = ('\u{20}'..='\u{7e}').count() + WARM_SYMBOLS.chars().count();
+        let total = per_font * WARM_FONTS.len() + WARM_HUGE.chars().count();
+        let mut done = 0;
+        while done < budget && self.warm_pos < total {
+            let i = self.warm_pos;
+            self.warm_pos += 1;
+            let (font, ch) = if i < per_font * WARM_FONTS.len() {
+                let f = WARM_FONTS[i / per_font];
+                let k = i % per_font;
+                let ch = ('\u{20}'..='\u{7e}')
+                    .chain(WARM_SYMBOLS.chars())
+                    .nth(k)
+                    .unwrap_or(' ');
+                (f, ch)
+            } else {
+                let k = i - per_font * WARM_FONTS.len();
+                (Font::Huge, WARM_HUGE.chars().nth(k).unwrap_or('0'))
+            };
+            let face = self.face(font);
+            let _ = self.fonts.glyph(face, ch);
+            done += 1;
+        }
+        self.warm_pos < total
     }
 
     /// Blit the dirty region (if any) to the display.
@@ -350,6 +486,17 @@ impl Canvas {
     pub fn invalidate(&mut self) {
         self.dirty = Some(self.bounds());
     }
+}
+
+/// `a/255` of the way from `d` to `c`, per channel.
+pub fn mix(d: Rgb888, c: Rgb888, a: u8) -> Rgb888 {
+    let a = u32::from(a);
+    let ch = |shift: u32| {
+        let dv = (d >> shift) & 0xFF;
+        let cv = (c >> shift) & 0xFF;
+        ((dv * (255 - a) + cv * a + 127) / 255) << shift
+    };
+    ch(16) | ch(8) | ch(0)
 }
 
 fn clip(r: Rect, b: Rect) -> Rect {
@@ -396,29 +543,53 @@ pub enum ButtonStyle {
     Primary,
     Danger,
     Ok,
+    /// Drawn but inert (e.g. a key that does nothing on this screen).
+    Disabled,
 }
 
-/// Per-frame UI context: canvas + the pointer click (if any) delivered for
-/// this frame.
+/// Pointer state for one frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PointerFrame {
+    /// Where the pointer is held down right now (for pressed highlights).
+    pub held: Option<(i32, i32)>,
+    /// A completed tap: where it went down and where it was released.
+    pub click: Option<((i32, i32), (i32, i32))>,
+}
+
+/// Per-frame UI context: canvas plus this frame's pointer state.
 #[derive(Debug)]
 pub struct Ui<'a> {
     pub c: &'a mut Canvas,
     pub theme: Theme,
-    click: Option<(i32, i32)>,
+    ptr: PointerFrame,
+    /// The press began here (for highlight: only the widget it began on).
+    held_from: Option<(i32, i32)>,
+    /// Every tappable area drawn this frame, with its label (tests, and
+    /// a record of what was on screen).
+    pub targets: Vec<(Rect, String)>,
 }
 
 impl<'a> Ui<'a> {
-    pub fn new(c: &'a mut Canvas, click: Option<(i32, i32)>) -> Ui<'a> {
+    /// `held_from` is where the current press began, if one is in progress.
+    pub fn new(c: &'a mut Canvas, ptr: PointerFrame, held_from: Option<(i32, i32)>) -> Ui<'a> {
         Ui {
             c,
             theme: THEME,
-            click,
+            ptr,
+            held_from,
+            targets: Vec::new(),
         }
     }
 
-    /// Unit of spacing (8 px at scale 1).
+    /// Register a tappable area; true if it was tapped this frame.
+    pub fn target(&mut self, r: Rect, label: &str) -> bool {
+        self.targets.push((r, label.into()));
+        self.clicked_in(r)
+    }
+
+    /// Unit of spacing (8 px at 1024×768).
     pub fn u(&self) -> i32 {
-        8 * self.c.scale
+        self.c.px(8).max(4)
     }
 
     pub fn clear(&mut self) {
@@ -427,7 +598,8 @@ impl<'a> Ui<'a> {
     }
 
     pub fn panel(&mut self, r: Rect) {
-        self.c.fill_rect(r, self.theme.panel);
+        let rad = self.c.px(6);
+        self.c.fill_round_rect(r, rad, self.theme.panel);
     }
 
     pub fn label(&mut self, r: Rect, s: &str, font: Font, align: u8) {
@@ -437,40 +609,83 @@ impl<'a> Ui<'a> {
         self.c.text_in(r, s, font, color, align);
     }
 
-    /// Draw a button; returns true if it was clicked this frame.
-    pub fn button(&mut self, r: Rect, label: &str, style: ButtonStyle) -> bool {
-        let bg = match style {
-            ButtonStyle::Normal => self.theme.button,
-            ButtonStyle::Primary => self.theme.accent,
-            ButtonStyle::Danger => self.theme.danger,
-            ButtonStyle::Ok => self.theme.ok,
-        };
-        self.c.fill_rect(r, bg);
-        self.c.frame_rect(r, 1, self.theme.bg);
-        // Large only when the label fits on one line at that size.
-        let large_w = label.chars().count() as i32 * Font::Large.cell().0 * self.c.scale;
-        let font = if r.h >= 3 * Font::Normal.cell().1 * self.c.scale
-            && label.chars().count() <= 6
-            && large_w <= r.inset(4).w
-        {
-            Font::Large
-        } else {
-            Font::Normal
-        };
-        self.c
-            .text_in(r.inset(4), label, font, self.theme.button_text, 1);
-        matches!(self.click, Some((x, y)) if r.contains(x, y))
+    /// Is a press that began inside `r` still held inside it?
+    pub fn pressed_in(&self, r: Rect) -> bool {
+        matches!((self.held_from, self.ptr.held),
+            (Some((ax, ay)), Some((bx, by))) if r.contains(ax, ay) && r.contains(bx, by))
     }
 
-    /// A row in a list; `selected` rows are highlighted. Returns true if clicked.
+    /// Was `r` tapped this frame (pressed and released inside it)?
+    pub fn clicked_in(&self, r: Rect) -> bool {
+        matches!(self.ptr.click,
+            Some(((ax, ay), (bx, by))) if r.contains(ax, ay) && r.contains(bx, by))
+    }
+
+    /// The largest font in which every label fits a `cell` (one line in
+    /// [`Font::Large`], up to three otherwise), so a grid of buttons reads
+    /// as one set.
+    pub fn grid_font<'s>(&self, cell: Rect, labels: impl IntoIterator<Item = &'s str>) -> Font {
+        let labels: Vec<&str> = labels.into_iter().collect();
+        let inner = self.label_area(cell);
+        for f in Font::FIT_ORDER {
+            let lines = if f == Font::Large { 1 } else { 3 };
+            if labels.iter().all(|l| self.c.fits(l, f, inner, lines)) {
+                return f;
+            }
+        }
+        Font::Small
+    }
+
+    fn label_area(&self, r: Rect) -> Rect {
+        let pad = self.u() / 2 + 1;
+        r.inset(pad)
+    }
+
+    /// Draw a button with the best-fitting font; true if tapped this frame.
+    pub fn button(&mut self, r: Rect, label: &str, style: ButtonStyle) -> bool {
+        let f = self.grid_font(r, [label]);
+        self.button_font(r, label, style, f)
+    }
+
+    /// Draw a button in `font` (wrapped to fit); true if tapped this frame.
+    pub fn button_font(&mut self, r: Rect, label: &str, style: ButtonStyle, font: Font) -> bool {
+        let (bg, fg) = match style {
+            ButtonStyle::Normal => (self.theme.button, self.theme.button_text),
+            ButtonStyle::Primary => (self.theme.accent, self.theme.button_text),
+            ButtonStyle::Danger => (self.theme.danger, self.theme.button_text),
+            ButtonStyle::Ok => (self.theme.ok, self.theme.button_text),
+            ButtonStyle::Disabled => (self.theme.panel, self.theme.muted),
+        };
+        let live = style != ButtonStyle::Disabled;
+        let pressed = live && self.pressed_in(r);
+        let bg = if pressed {
+            mix(bg, 0x00FF_FFFF, 90)
+        } else {
+            bg
+        };
+        let rad = self.c.px(6);
+        self.c.fill_round_rect(r, rad, bg);
+        if pressed {
+            let t = self.c.px(2).max(1);
+            self.c.frame_rect(r.inset(t), t, mix(bg, 0x00FF_FFFF, 160));
+        }
+        let inner = self.label_area(r);
+        self.c.text_wrapped(inner, label, font, fg);
+        live && self.target(r, label)
+    }
+
+    /// A row in a list; `selected` rows are highlighted. Returns true if tapped.
     pub fn row(&mut self, r: Rect, cols: &[(&str, i32, u8)], selected: bool) -> bool {
         if selected {
             self.c.fill_rect(r, self.theme.select);
+        } else if self.pressed_in(r) {
+            self.c.fill_rect(r, self.theme.button);
         }
-        let mut x = r.x + 4;
+        let pad = self.u() / 2;
+        let mut x = r.x + pad;
         for &(s, w, align) in cols {
             self.c.text_in(
-                Rect::new(x, r.y, w - 8, r.h),
+                Rect::new(x, r.y, w - 2 * pad, r.h),
                 s,
                 Font::Normal,
                 self.theme.text,
@@ -478,17 +693,16 @@ impl<'a> Ui<'a> {
             );
             x += w;
         }
-        matches!(self.click, Some((cx, cy)) if r.contains(cx, cy))
-    }
-
-    pub fn clicked_in(&self, r: Rect) -> bool {
-        matches!(self.click, Some((x, y)) if r.contains(x, y))
+        let label = cols.iter().map(|c| c.0).collect::<Vec<_>>().join(" ");
+        self.target(r, label.trim())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::borrow::ToOwned;
+    use alloc::string::ToString;
     use pos_hal::{HalError, PixelFormat};
 
     struct MockDisplay {
@@ -551,31 +765,124 @@ mod tests {
         assert_eq!(d.blits, 2);
     }
 
+    /// Every currency and UI symbol the app uses has a real glyph (not the
+    /// empty "missing glyph" box), with anti-aliased edges.
     #[test]
-    fn text_draws_pixels_and_measures() {
+    fn text_draws_every_needed_glyph() {
         let mut c = Canvas::new(1024, 768);
-        let w = c.text(0, 0, "€£¥₹A", Font::Normal, 0xFFFFFF);
-        assert_eq!(w, 50);
-        // Each glyph cell has at least one lit pixel.
-        for g in 0..5 {
-            let lit = (0..20).any(|y| (0..10).any(|x| c.pixel(g * 10 + x, y) == Some(0xFFFFFF)));
-            assert!(lit, "glyph {g} empty");
+        let set = "Aé€£¥₹₦₱₽₺₩ŠŒ…←→⇧⌫◀▶✓✕•×›−";
+        let mut x = 0;
+        for ch in set.chars() {
+            let s = ch.encode_utf8(&mut [0; 4]).to_owned();
+            c.fill_rect(c.bounds(), 0);
+            let w = c.text(0, 0, &s, Font::Large, 0xFFFFFF);
+            assert!(w > 0, "{ch} has no advance");
+            let h = c.line_height(Font::Large);
+            let lit: Vec<u32> = (0..h)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .filter_map(|(x, y)| c.pixel(x, y))
+                .filter(|p| *p != 0)
+                .collect();
+            assert!(lit.len() > 10, "{ch} drew nothing");
+            assert!(
+                lit.iter().any(|p| *p != 0xFFFFFF),
+                "{ch} has no anti-aliasing"
+            );
+            x += w;
+        }
+        assert!(x > 0);
+    }
+
+    #[test]
+    fn digits_are_tabular() {
+        let c = Canvas::new(1024, 768);
+        let w0 = c.text_width("0", Font::Normal);
+        for d in "123456789".chars() {
+            assert_eq!(c.text_width(&d.to_string(), Font::Normal), w0);
         }
     }
 
     #[test]
-    fn button_click_hit_test() {
-        let mut c = Canvas::new(1024, 768);
-        let r = Rect::new(100, 100, 80, 40);
-        let mut ui = Ui::new(&mut c, Some((120, 110)));
-        assert!(ui.button(r, "OK", ButtonStyle::Primary));
-        assert!(!ui.button(Rect::new(0, 0, 10, 10), "X", ButtonStyle::Normal));
+    fn fit_and_wrap() {
+        let c = Canvas::new(1024, 768);
+        let s = "Long product name that does not fit";
+        let cut = c.fit(s, Font::Normal, 100);
+        assert!(cut.ends_with('…'));
+        assert!(c.text_width(&cut, Font::Normal) <= 100);
+        let lines = c.wrap(s, Font::Normal, 120);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|l| c.text_width(l, Font::Normal) <= 120));
+        assert_eq!(c.fit("Milk", Font::Normal, 100), "Milk");
     }
 
     #[test]
-    fn scale_from_resolution() {
-        assert_eq!(Canvas::new(1024, 768).scale, 1);
-        assert_eq!(Canvas::new(1920, 1080).scale, 1);
-        assert_eq!(Canvas::new(2048, 1536).scale, 2);
+    fn button_tap_needs_press_and_release_inside() {
+        let mut c = Canvas::new(1024, 768);
+        let r = Rect::new(100, 100, 80, 40);
+        let tap = |down, up| PointerFrame {
+            held: None,
+            click: Some((down, up)),
+        };
+        let mut ui = Ui::new(&mut c, tap((120, 110), (125, 115)), None);
+        assert!(ui.button(r, "OK", ButtonStyle::Primary));
+        assert!(!ui.button(Rect::new(0, 0, 10, 10), "X", ButtonStyle::Normal));
+        assert!(!ui.button(r, "OK", ButtonStyle::Disabled));
+        // Slid off the button before release: no tap.
+        let mut ui = Ui::new(&mut c, tap((120, 110), (300, 300)), None);
+        assert!(!ui.button(r, "OK", ButtonStyle::Primary));
+    }
+
+    #[test]
+    fn pressed_button_is_highlighted() {
+        let mut c = Canvas::new(1024, 768);
+        let r = Rect::new(100, 100, 80, 40);
+        let held = PointerFrame {
+            held: Some((105, 135)),
+            click: None,
+        };
+        let mut ui = Ui::new(&mut c, held, Some((105, 135)));
+        ui.button(r, "", ButtonStyle::Normal);
+        let lit = c.pixel(140, 120).unwrap();
+        let mut c2 = Canvas::new(1024, 768);
+        let mut ui = Ui::new(&mut c2, PointerFrame::default(), None);
+        ui.button(r, "", ButtonStyle::Normal);
+        assert_eq!(c2.pixel(140, 120), Some(THEME.button));
+        assert_ne!(lit, THEME.button);
+    }
+
+    #[test]
+    fn grid_font_is_shared() {
+        let c = Canvas::new(1024, 768);
+        let mut c = c;
+        let ui = Ui::new(&mut c, PointerFrame::default(), None);
+        let cell = Rect::new(0, 0, 120, 90);
+        assert_eq!(ui.grid_font(cell, ["Bread"]), Font::Large);
+        // One long label pulls the whole grid down to the same size.
+        assert_ne!(
+            ui.grid_font(cell, ["Bread", "Milk 1L long-life"]),
+            Font::Large
+        );
+    }
+
+    #[test]
+    fn warm_finishes_and_matches_drawing() {
+        let mut a = Canvas::new(1024, 768);
+        while a.warm(50) {}
+        let mut b = Canvas::new(1024, 768);
+        a.fill_rect(a.bounds(), 0);
+        b.fill_rect(b.bounds(), 0);
+        a.text(5, 5, "Total 18.99 €", Font::Large, 0xFFFFFF);
+        b.text(5, 5, "Total 18.99 €", Font::Large, 0xFFFFFF);
+        assert!(a.px == b.px);
+    }
+
+    #[test]
+    fn zoom_from_resolution() {
+        assert_eq!(Canvas::new(1024, 768).zoom(), 1000);
+        assert_eq!(Canvas::new(1280, 800).zoom(), 1041);
+        assert_eq!(Canvas::new(1920, 1080).zoom(), 1406);
+        assert_eq!(Canvas::new(2048, 1536).zoom(), 2000);
+        let c = Canvas::new(1920, 1080);
+        assert!(c.line_height(Font::Normal) > Canvas::new(1024, 768).line_height(Font::Normal));
     }
 }

@@ -155,8 +155,18 @@ pub struct App<D: BlockDevice> {
     pub(crate) message: Option<(String, bool)>,
     pub(crate) recent: VecDeque<Journaled>,
     pub(crate) key: [u8; 32],
-    pub(crate) click: Option<(i32, i32)>,
-    pub(crate) pointer_down: bool,
+    /// Where the current press began, and where the pointer is now.
+    pub(crate) press_from: Option<(i32, i32)>,
+    pub(crate) press_now: Option<(i32, i32)>,
+    /// Last accepted tap (time, position), for debouncing.
+    pub(crate) last_tap: Option<(u64, i32, i32)>,
+    /// Quick-key page shown, and whether the sale keypad replaces it.
+    pub(crate) qk_page: usize,
+    pub(crate) sale_pad: bool,
+    /// The sale just completed, for the change screen.
+    pub(crate) last_sale: Option<Sale>,
+    /// Tappable areas of the last frame drawn.
+    pub(crate) targets: Vec<(pos_ui::Rect, String)>,
     pub(crate) dirty: bool,
     pub(crate) fatal: bool,
     pub(crate) printer_ok: bool,
@@ -212,8 +222,13 @@ impl<D: BlockDevice> App<D> {
             message: None,
             recent: VecDeque::new(),
             key,
-            click: None,
-            pointer_down: false,
+            press_from: None,
+            press_now: None,
+            last_tap: None,
+            qk_page: 0,
+            sale_pad: false,
+            last_sale: None,
+            targets: Vec::new(),
             dirty: true,
             fatal: false,
             printer_ok: true,
@@ -414,15 +429,21 @@ impl<D: BlockDevice> App<D> {
                 at_us,
             } => {
                 self.now_us = at_us;
-                // Click = release after press.
+                let p = (x as i32, y as i32);
+                // A tap is a press and a release; the widget acts only if
+                // both land on it. While held, the widget under the finger
+                // is drawn pressed.
                 if pressed {
-                    self.pointer_down = true;
-                } else if self.pointer_down {
-                    self.pointer_down = false;
-                    self.click = Some((x as i32, y as i32));
-                    // Run one frame so widgets see the click, then act on it.
-                    screens::on_click(self, hw);
-                    self.click = None;
+                    if self.press_from.is_none() {
+                        self.press_from = Some(p);
+                    }
+                    self.press_now = Some(p);
+                } else if let Some(from) = self.press_from.take() {
+                    self.press_now = None;
+                    if !self.bounce(at_us, p) {
+                        self.last_tap = Some((at_us, p.0, p.1));
+                        screens::on_click(self, (from, p), hw);
+                    }
                 }
             }
         }
@@ -433,25 +454,50 @@ impl<D: BlockDevice> App<D> {
         }
     }
 
+    /// Resistive panels and shaky fingers can report a second tap a few
+    /// tens of milliseconds after the first; drop a tap that close in time
+    /// and place to the last accepted one.
+    fn bounce(&self, at_us: u64, p: (i32, i32)) -> bool {
+        const WINDOW_US: u64 = 150_000;
+        let near = self.canvas.px(24);
+        matches!(self.last_tap, Some((t, x, y))
+            if at_us.saturating_sub(t) < WINDOW_US
+                && (x - p.0).abs() <= near
+                && (y - p.1).abs() <= near)
+    }
+
     /// Periodic tick (clock in the status bar).
     pub fn tick(&mut self, _hw: &mut Hw<'_>) {
         self.dirty = true;
+        self.canvas.warm(48);
     }
 
     /// Redraw if needed and present to the display.
     pub fn render(&mut self, hw: &mut Hw<'_>) {
         if !self.dirty {
+            // Idle: get a few glyphs ready for screens not yet shown.
+            self.canvas.warm(4);
             return;
         }
         self.dirty = false;
         let now = self.now(hw);
-        screens::draw(self, None, now);
+        let ptr = pos_ui::PointerFrame {
+            held: self.press_now,
+            click: None,
+        };
+        let from = self.press_from;
+        screens::draw(self, ptr, from, now);
         let _ = self.canvas.present(hw.display);
     }
 
     /// Shut down and hand back the storage device (tests, reformat).
     pub fn into_device(self) -> Option<D> {
         self.store.map(Store::into_device).or(self.pending_dev)
+    }
+
+    /// Tappable areas of the last frame, with their labels (tests).
+    pub fn tap_targets(&self) -> &[(pos_ui::Rect, String)] {
+        &self.targets
     }
 
     /// Bytes of the current back buffer (tests).

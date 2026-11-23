@@ -11,8 +11,8 @@ pos-hal/        hardware traits: Display, Input, Clock, BlockDevice, ExternalMed
                 Printer, Rng, Power
 pos-store/      log-structured store on a raw partition (superblocks, snapshots,
                 CRC32C + BLAKE3 hash chain, ring with export watermark, machine binding)
-pos-ui/         software-rendered immediate-mode UI, Latin-1 + currency fonts,
-                scanner (keyboard-wedge) detection
+pos-ui/         software-rendered immediate-mode UI, anti-aliased DejaVu Sans
+                (embedded subset), touch widgets, scanner (keyboard-wedge) detection
 pos-escpos/     ESC/POS encoder (code pages, cut, drawer kick, EAN-13, Code 128, QR)
 pos-app/        the application (screens, commit-before-confirm, receipts, export/import),
                 generic over pos-hal — shared by Tier A and Tier B

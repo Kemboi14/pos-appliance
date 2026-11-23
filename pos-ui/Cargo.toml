@@ -10,5 +10,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-embedded-graphics = { version = "=0.8.2", default-features = false }
+ab_glyph = { version = "=0.2.32", default-features = false, features = ["libm"] }
+libm = { version = "=0.2.16", default-features = false }
 pos-hal.workspace = true

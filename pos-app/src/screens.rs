@@ -17,7 +17,7 @@ use pos_core::{Money, Qty, Rate};
 use pos_hal::{BlockDevice, Key, Modifiers};
 use pos_store::Trust;
 use pos_ui::scan::Enter;
-use pos_ui::{ButtonStyle, Font, Rect, Ui};
+use pos_ui::{ButtonStyle, Font, PointerFrame, Rect, Ui};
 
 use crate::receipt;
 use crate::{App, AppError, BootStatus, Hw, Journaled};
@@ -101,6 +101,84 @@ pub struct Prompt {
     pub field: String,
     pub secret: bool,
     pub next: Next,
+    /// On-screen keyboard shift state (text prompts only).
+    pub shift: Shift,
+}
+
+/// On-screen keyboard shift: off, next letter only, or caps lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shift {
+    Off,
+    Once,
+    Lock,
+}
+
+/// What a prompt's field holds, which decides the on-screen keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Input {
+    /// Whole numbers: user numbers, PINs, receipt numbers, menu choices.
+    Digits,
+    /// Amounts and quantities (digits and a decimal point).
+    Amount,
+    /// Free text: names, codes, reasons.
+    Text,
+}
+
+impl Next {
+    pub(crate) fn input(&self) -> Input {
+        match self {
+            Next::FormatConfirm
+            | Next::SetupName
+            | Next::CardRef(_)
+            | Next::VoucherCode
+            | Next::RefundReason(..)
+            | Next::RefundCardRef(..)
+            | Next::AddUserName(_) => Input::Text,
+            Next::Float | Next::VoucherAmount(_) | Next::ZCounted | Next::RefundQty(..) => {
+                Input::Amount
+            }
+            Next::AdoptUser
+            | Next::AdoptPin(_)
+            | Next::SetupPin1(_)
+            | Next::SetupPin2(..)
+            | Next::AddUserPin(..)
+            | Next::LoginUser
+            | Next::LoginPin(_)
+            | Next::OverrideUser(_)
+            | Next::OverridePin(..)
+            | Next::ReprintNo
+            | Next::RefundReceipt
+            | Next::RefundPayout(..)
+            | Next::UnlockUser => Input::Digits,
+        }
+    }
+
+    /// Does Escape leave this prompt (rather than just clear the field)?
+    pub(crate) fn cancellable(&self) -> bool {
+        !matches!(
+            self,
+            Next::FormatConfirm
+                | Next::AdoptUser
+                | Next::AdoptPin(_)
+                | Next::SetupName
+                | Next::SetupPin1(_)
+                | Next::SetupPin2(..)
+                | Next::LoginUser
+        )
+    }
+
+    fn initial_shift(&self) -> Shift {
+        match self {
+            // Codes and the ERASE confirmation are upper case.
+            Next::FormatConfirm
+            | Next::CardRef(_)
+            | Next::VoucherCode
+            | Next::RefundCardRef(..) => Shift::Lock,
+            // Names and reasons start with a capital.
+            Next::SetupName | Next::AddUserName(_) | Next::RefundReason(..) => Shift::Once,
+            _ => Shift::Off,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +216,7 @@ fn prompt(title: &str, hint: &str, secret: bool, next: Next) -> Screen {
         hint: hint.into(),
         field: String::new(),
         secret,
+        shift: next.initial_shift(),
         next,
     })
 }
@@ -185,7 +264,10 @@ fn login_prompt<D: BlockDevice>(app: &App<D>) -> Screen {
         .collect();
     prompt(
         "Sign in",
-        &format!("User number ({})", users.join(", ")),
+        &format!(
+            "Tap your name, or type your user number ({})",
+            users.join(", ")
+        ),
         false,
         Next::LoginUser,
     )
@@ -222,8 +304,19 @@ pub(crate) fn on_key<D: BlockDevice>(
             }
         }
         Screen::Done { .. } => {
+            // Any key starts the next sale; anything but Enter/Escape (e.g.
+            // the first character of a scan) is then handled as a sale key.
             app.message = None;
-            Screen::Sale
+            if matches!(key, Key::Enter | Key::Escape) {
+                Screen::Sale
+            } else {
+                sale_key(app, key, at, hw);
+                if matches!(app.screen, Screen::Blank) {
+                    Screen::Sale
+                } else {
+                    core::mem::replace(&mut app.screen, Screen::Blank)
+                }
+            }
         }
         Screen::Menu { sel } => menu_key(app, sel, key, hw),
         Screen::Info { title, lines } => match key {
@@ -262,6 +355,9 @@ fn prompt_key<D: BlockDevice>(
     match key {
         Key::Char(c) if p.field.chars().count() < 40 => {
             p.field.push(c);
+            if c.is_alphabetic() && p.shift == Shift::Once {
+                p.shift = Shift::Off;
+            }
             Screen::Prompt(p)
         }
         Key::Backspace => {
@@ -1227,6 +1323,14 @@ fn sale_key<D: BlockDevice>(app: &mut App<D>, key: Key, at: u64, hw: &mut Hw<'_>
             );
         }
         Key::F(10) => app.screen = Screen::Menu { sel: 0 },
+        Key::PageUp => {
+            app.scan.other_key();
+            app.qk_page = app.qk_page.saturating_sub(1);
+        }
+        Key::PageDown => {
+            app.scan.other_key();
+            app.qk_page = (app.qk_page + 1).min(quick_pages(app).saturating_sub(1));
+        }
         Key::F(11) => {
             if app.cart.is_empty() {
                 app.screen = authorize(app, Pending::NoSale, hw);
@@ -1338,6 +1442,11 @@ fn finish_sale<D: BlockDevice>(app: &mut App<D>, pay: Payment, hw: &mut Hw<'_>) 
     app.cart = Default::default();
     app.sel = None;
     app.entry.clear();
+    app.last_sale = Some(sale.clone());
+    // Drop the last "+ item" notice, but keep warnings (e.g. a printer error).
+    if matches!(app.message, Some((_, false))) {
+        app.message = None;
+    }
     Screen::Done {
         change: sale.change,
         receipt: sale.receipt_no,
@@ -1551,54 +1660,348 @@ fn refund_pick_key<D: BlockDevice>(
     }
 }
 
-// ------------------------------------------------------------------ drawing
+// ------------------------------------------------------------------ touch
 
-/// Clickable actions are mapped to keys.
-pub(crate) fn on_click<D: BlockDevice>(app: &mut App<D>, hw: &mut Hw<'_>) {
-    let now = app.now(hw);
-    let click = app.click;
-    if let Some(k) = draw(app, click, now) {
-        let at = app.now_us;
-        match k {
-            UiAction::Key(key) => on_key(app, key, Modifiers::default(), at, hw),
-            UiAction::Code(code) => {
-                if matches!(app.screen, Screen::Sale) {
-                    add_code(app, &code);
-                }
-            }
-            UiAction::Select(i) => app.sel = Some(i),
-        }
-    }
+/// Quick keys per page: positions `p*12 .. p*12+11` of the catalog's
+/// `quick_key` column fill page `p`, in a 4×3 grid, so the catalog decides
+/// the layout and it is the same on every screen size.
+pub(crate) const QK_PER_PAGE: usize = 12;
+
+pub(crate) fn quick_pages<D: BlockDevice>(app: &App<D>) -> usize {
+    app.state
+        .catalog
+        .quick_keys()
+        .iter()
+        .filter_map(|i| i.quick_key)
+        .max()
+        .map_or(1, |m| usize::from(m) / QK_PER_PAGE + 1)
 }
 
+/// Tappable actions. Most map onto keys, so behaviour stays in `on_key`.
 #[derive(Debug, Clone)]
 pub(crate) enum UiAction {
     Key(Key),
+    /// Several characters at once (the "00" key).
+    Type(&'static str),
+    /// Add an item by SKU (quick key, search result).
     Code(String),
+    /// Select a cart line.
     Select(usize),
+    /// Fill the prompt with this value and submit it (user tiles, choices).
+    Submit(String),
+    /// Clear the field being typed.
+    Clear,
+    /// Cycle the on-screen keyboard's shift.
+    Shift,
+    Menu(usize),
+    RefundRow(usize),
+    Page(isize),
+    TogglePad,
 }
 
-pub(crate) fn draw<D: BlockDevice>(
+/// Run one frame with the tap so widgets can see it, then act on it.
+pub(crate) fn on_click<D: BlockDevice>(
     app: &mut App<D>,
-    click: Option<(i32, i32)>,
-    now: i64,
-) -> Option<UiAction> {
+    tap: ((i32, i32), (i32, i32)),
+    hw: &mut Hw<'_>,
+) {
+    let now = app.now(hw);
+    let frame = PointerFrame {
+        held: None,
+        click: Some(tap),
+    };
+    let Some(action) = draw(app, frame, Some(tap.0), now) else {
+        return;
+    };
+    let at = app.now_us;
+    // Taps are never part of a scanner burst.
+    app.scan.reset();
+    let key = |app: &mut App<D>, k: Key, hw: &mut Hw<'_>| {
+        on_key(app, k, Modifiers::default(), at, hw);
+    };
+    match action {
+        UiAction::Key(k) => key(app, k, hw),
+        UiAction::Type(s) => {
+            for c in s.chars() {
+                key(app, Key::Char(c), hw);
+            }
+        }
+        UiAction::Code(code) => match app.screen {
+            Screen::Sale => add_code(app, &code),
+            Screen::Search { .. } => {
+                add_code(app, &code);
+                app.screen = Screen::Sale;
+            }
+            _ => {}
+        },
+        UiAction::Select(i) => app.sel = Some(i),
+        UiAction::Submit(v) => {
+            if let Screen::Prompt(p) = &mut app.screen {
+                p.field = v;
+                key(app, Key::Enter, hw);
+            }
+        }
+        UiAction::Clear => match &mut app.screen {
+            Screen::Prompt(p) => p.field.clear(),
+            Screen::Search { query, sel } => {
+                query.clear();
+                *sel = 0;
+            }
+            _ => app.entry.clear(),
+        },
+        UiAction::Shift => {
+            if let Screen::Prompt(p) = &mut app.screen {
+                p.shift = match p.shift {
+                    Shift::Off => Shift::Once,
+                    Shift::Once => Shift::Lock,
+                    Shift::Lock => Shift::Off,
+                };
+            }
+        }
+        UiAction::Menu(i) => {
+            if matches!(app.screen, Screen::Menu { .. }) {
+                app.screen = menu_select(app, i, hw);
+            }
+        }
+        UiAction::RefundRow(i) => {
+            if let Screen::RefundPick { sel, .. } = &mut app.screen {
+                *sel = i;
+                key(app, Key::Enter, hw);
+            }
+        }
+        UiAction::Page(d) => {
+            let n = quick_pages(app) as isize;
+            app.qk_page = (app.qk_page as isize + d).clamp(0, (n - 1).max(0)) as usize;
+        }
+        UiAction::TogglePad => app.sale_pad = !app.sale_pad,
+    }
+}
+
+// ------------------------------------------------------------------ drawing
+
+/// Which number pad to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pad {
+    Digits,
+    Amount,
+    Sale,
+    Pay,
+}
+
+type PadKey = (&'static str, Option<UiAction>, ButtonStyle);
+
+fn numpad(ui: &mut Ui<'_>, r: Rect, kind: Pad) -> Option<UiAction> {
+    use ButtonStyle as S;
+    let ch = |c: char| Some(UiAction::Key(Key::Char(c)));
+    let off: PadKey = ("", None, S::Disabled);
+    let digit = |l: &'static str| -> PadKey { (l, ch(l.chars().next().unwrap_or('0')), S::Normal) };
+    let (k3, k4, k5, ok): (PadKey, PadKey, PadKey, PadKey) = match kind {
+        Pad::Digits => (
+            ("Cancel", Some(UiAction::Key(Key::Escape)), S::Normal),
+            off.clone(),
+            off.clone(),
+            ("OK", Some(UiAction::Key(Key::Enter)), S::Primary),
+        ),
+        Pad::Amount => (
+            ("Cancel", Some(UiAction::Key(Key::Escape)), S::Normal),
+            (".", ch('.'), S::Normal),
+            ("00", Some(UiAction::Type("00")), S::Normal),
+            ("OK", Some(UiAction::Key(Key::Enter)), S::Primary),
+        ),
+        Pad::Sale => (
+            ("× Qty", ch('*'), S::Normal),
+            (".", ch('.'), S::Normal),
+            ("00", Some(UiAction::Type("00")), S::Normal),
+            ("Enter", Some(UiAction::Key(Key::Enter)), S::Primary),
+        ),
+        Pad::Pay => (
+            ("Back", Some(UiAction::Key(Key::Escape)), S::Normal),
+            (".", ch('.'), S::Normal),
+            ("00", Some(UiAction::Type("00")), S::Normal),
+            ("Cash", Some(UiAction::Key(Key::Enter)), S::Ok),
+        ),
+    };
+    let keys: [PadKey; 16] = [
+        digit("7"),
+        digit("8"),
+        digit("9"),
+        ("⌫", Some(UiAction::Key(Key::Backspace)), S::Danger),
+        digit("4"),
+        digit("5"),
+        digit("6"),
+        ("C", Some(UiAction::Clear), S::Normal),
+        digit("1"),
+        digit("2"),
+        digit("3"),
+        k3,
+        k4,
+        digit("0"),
+        k5,
+        ok,
+    ];
+    let u = ui.u();
+    let cells = r.grid(4, 4, u / 2);
+    let font = ui.grid_font(cells[0], keys.iter().map(|k| k.0));
     let mut action = None;
-    let status = status_line(app, now);
-    let message = app.message.clone();
-    let screen = app.screen.clone();
+    for ((label, act, style), cell) in keys.into_iter().zip(cells) {
+        if ui.button_font(cell, label, style, font) {
+            action = act;
+        }
+    }
+    action
+}
+
+/// On-screen keyboard for text prompts and search.
+fn keyboard(ui: &mut Ui<'_>, r: Rect, shift: Shift, cancel: bool) -> Option<UiAction> {
+    use ButtonStyle as S;
+    let upper = shift != Shift::Off;
+    let u = ui.u();
+    let cells = r.grid(11, 5, u / 2);
+    let mut action = None;
+    let letters = ["1234567890", "qwertyuiop/", "asdfghjkl-.", "zxcvbnm,'&"];
+    let font = ui.grid_font(cells[0], ["W", "⌫", "⇧"]);
+    let char_key = |ui: &mut Ui<'_>, cell: Rect, c: char, action: &mut Option<UiAction>| {
+        let c = if upper { c.to_ascii_uppercase() } else { c };
+        let mut buf = [0u8; 4];
+        if ui.button_font(cell, c.encode_utf8(&mut buf), S::Normal, font) {
+            *action = Some(UiAction::Key(Key::Char(c)));
+        }
+    };
+    for (row, keys) in letters.iter().enumerate() {
+        let base = row * 11;
+        // Row 3 starts with Shift.
+        let skip = usize::from(row == 3);
+        for (k, c) in keys.chars().enumerate() {
+            char_key(ui, cells[base + skip + k], c, &mut action);
+        }
+    }
+    if ui.button_font(cells[10], "⌫", S::Danger, font) {
+        action = Some(UiAction::Key(Key::Backspace));
+    }
+    let (shift_label, shift_style) = match shift {
+        Shift::Off => ("⇧", S::Normal),
+        Shift::Once => ("⇧", S::Primary),
+        Shift::Lock => ("CAPS", S::Ok),
+    };
+    let shift_font = if shift == Shift::Lock {
+        ui.grid_font(cells[33], ["CAPS"])
+    } else {
+        font
+    };
+    if ui.button_font(cells[33], shift_label, shift_style, shift_font) {
+        action = Some(UiAction::Shift);
+    }
+    // Bottom row: Cancel ×2, Clear ×2, Space ×5, OK ×2.
+    let row = &cells[44..55];
+    let bottom: [(Rect, &str, Option<UiAction>, ButtonStyle); 4] = [
+        (
+            Rect::span(row, 0, 2),
+            "Cancel",
+            Some(UiAction::Key(Key::Escape)),
+            if cancel { S::Normal } else { S::Disabled },
+        ),
+        (
+            Rect::span(row, 2, 2),
+            "Clear",
+            Some(UiAction::Clear),
+            S::Normal,
+        ),
+        (
+            Rect::span(row, 4, 5),
+            "Space",
+            Some(UiAction::Key(Key::Char(' '))),
+            S::Normal,
+        ),
+        (
+            Rect::span(row, 9, 2),
+            "OK",
+            Some(UiAction::Key(Key::Enter)),
+            S::Primary,
+        ),
+    ];
+    for (cell, label, act, style) in bottom {
+        if ui.button_font(cell, label, style, Font::Bold) {
+            action = act;
+        }
+    }
+    action
+}
+
+/// A grid of choice buttons (user tiles, payout kinds).
+fn choices(ui: &mut Ui<'_>, r: Rect, items: &[(String, String)]) -> Option<UiAction> {
+    let u = ui.u();
+    let n = items.len().max(1) as i32;
+    let cols = n.min(4);
+    let rows = (n + cols - 1) / cols;
+    let cell_h = (12 * u).min((r.h - (rows - 1) * u) / rows.max(1));
+    let cell_w = (r.w - 3 * u) / 4;
+    let area = r.centered(
+        cols * cell_w + (cols - 1) * u,
+        rows * cell_h + (rows - 1) * u,
+    );
+    let cells = area.grid(cols, rows, u);
+    let font = ui.grid_font(cells[0], items.iter().map(|i| i.0.as_str()));
+    let mut action = None;
+    for ((label, value), cell) in items.iter().zip(cells) {
+        if ui.button_font(cell, label, ButtonStyle::Primary, font) {
+            action = Some(UiAction::Submit(value.clone()));
+        }
+    }
+    action
+}
+
+/// Data the frame needs, copied out of the app before the canvas is borrowed.
+struct View {
+    status: String,
+    message: Option<(String, bool)>,
+    screen: Screen,
+    cfg: pos_core::config::Config,
+    priced: Option<pos_core::cart::Priced>,
+    cart: pos_core::cart::Cart,
+    sel: Option<usize>,
+    entry: String,
+    pending_qty: Option<Qty>,
+    payment: Option<Payment>,
+    quick: Vec<(usize, String, String)>,
+    qk_page: usize,
+    qk_pages: usize,
+    sale_pad: bool,
+    search: Vec<(String, String, String)>,
+    refund_lines: Vec<String>,
+    last_sale: Option<pos_core::sale::Sale>,
+    choices: Vec<(String, String)>,
+}
+
+fn prompt_choices<D: BlockDevice>(app: &App<D>, next: &Next, now: i64) -> Vec<(String, String)> {
+    let users = |f: &dyn Fn(&User) -> bool| -> Vec<(String, String)> {
+        app.state
+            .users
+            .values()
+            .filter(|u| u.active && f(u))
+            .map(|u| (format!("{} ({})", u.name, u.id), u.id.to_string()))
+            .collect()
+    };
+    let v = match next {
+        Next::LoginUser => users(&|_| true),
+        Next::AdoptUser => users(&|u| u.role == Role::Manager),
+        Next::OverrideUser(p) => users(&|u| app.state.allows(u.id, p.permission())),
+        Next::UnlockUser => users(&|u| app.state.is_locked(u.id, now)),
+        Next::RefundPayout(..) => vec![
+            ("Cash".into(), "1".into()),
+            ("Back to card".into(), "2".into()),
+            ("Voucher".into(), "3".into()),
+        ],
+        _ => Vec::new(),
+    };
+    // More tiles than fit comfortably: fall back to typing the number.
+    if v.len() > 12 { Vec::new() } else { v }
+}
+
+fn view<D: BlockDevice>(app: &App<D>, now: i64) -> View {
     let cfg = app.state.config.clone();
-    let priced = app.cart.price(&cfg).ok();
-    let quick: Vec<(String, String)> = app
-        .state
-        .catalog
-        .quick_keys()
-        .into_iter()
-        .take(12)
-        .map(|i| (i.sku.clone(), i.name.clone()))
-        .collect();
     let money = |m: Money| format!("{}", m.display(cfg.decimals));
-    let search: Vec<(String, String, String)> = match &screen {
+    let screen = app.screen.clone();
+    let search = match &screen {
         Screen::Search { query, .. } => app
             .state
             .catalog
@@ -1608,7 +2011,7 @@ pub(crate) fn draw<D: BlockDevice>(
             .collect(),
         _ => Vec::new(),
     };
-    let refund_lines: Vec<String> = match &screen {
+    let refund_lines = match &screen {
         Screen::RefundPick { receipt, picks, .. } => app
             .state
             .refundable
@@ -1621,10 +2024,10 @@ pub(crate) fn draw<D: BlockDevice>(
                         let pick = picks
                             .iter()
                             .find(|(x, _)| usize::from(*x) == i)
-                            .map(|(_, q)| format!(" -> refund {q}"))
+                            .map(|(_, q)| format!("  → refund {q}"))
                             .unwrap_or_default();
                         format!(
-                            "{:<20} sold {} refunded {} {}{}",
+                            "{}   sold {}, refunded {}   {}{}",
                             l.name,
                             l.qty,
                             l.refunded_qty,
@@ -1637,298 +2040,573 @@ pub(crate) fn draw<D: BlockDevice>(
             .unwrap_or_default(),
         _ => Vec::new(),
     };
-    let payment = app.payment.clone();
-    let cart = app.cart.clone();
-    let sel = app.sel;
-    let entry = app.entry.clone();
-    let pending_qty = app.pending_qty;
+    let choices = match &screen {
+        Screen::Prompt(p) => prompt_choices(app, &p.next, now),
+        _ => Vec::new(),
+    };
+    View {
+        status: status_line(app, now),
+        message: app.message.clone(),
+        priced: app.cart.price(&cfg).ok(),
+        cart: app.cart.clone(),
+        sel: app.sel,
+        entry: app.entry.clone(),
+        pending_qty: app.pending_qty,
+        payment: app.payment.clone(),
+        quick: app
+            .state
+            .catalog
+            .quick_keys()
+            .into_iter()
+            .filter_map(|i| Some((usize::from(i.quick_key?), i.sku.clone(), i.name.clone())))
+            .collect(),
+        qk_page: app.qk_page,
+        qk_pages: quick_pages(app),
+        sale_pad: app.sale_pad,
+        search,
+        refund_lines,
+        last_sale: app.last_sale.clone(),
+        choices,
+        screen,
+        cfg,
+    }
+}
 
-    let mut ui = Ui::new(&mut app.canvas, click);
+/// Draw one frame. `ptr` carries the pointer state; `held_from` is where
+/// the current (or just-finished) press began. Returns the tapped action.
+pub(crate) fn draw<D: BlockDevice>(
+    app: &mut App<D>,
+    ptr: PointerFrame,
+    held_from: Option<(i32, i32)>,
+    now: i64,
+) -> Option<UiAction> {
+    let v = view(app, now);
+    let mut ui = Ui::new(&mut app.canvas, ptr, held_from);
+    let mut action = None;
     ui.clear();
     let u = ui.u();
     let full = ui.c.bounds();
-    let (top, rest) = full.split_top(3 * u + 4);
-    let (body, bottom) = rest.split_bottom(4 * u);
-    ui.panel(top);
-    ui.label(top.inset(u), &status, Font::Normal, 0);
-    if let Some((m, err)) = &message {
+    let status_h = ui.c.line_height(Font::Normal) + 2 * u;
+    let (top, rest) = full.split_top(status_h);
+    let (body, bottom) = rest.split_bottom(ui.c.line_height(Font::Bold) + 2 * u);
+    ui.c.fill_rect(top, ui.theme.panel);
+    ui.label(top.inset(u), &v.status, Font::Normal, 0);
+    if let Some((m, err)) = &v.message {
         let col = if *err { ui.theme.danger } else { ui.theme.ok };
         ui.c.fill_rect(bottom, col);
-        ui.label_color(bottom.inset(u), m, Font::Normal, 0, ui.theme.button_text);
+        ui.label_color(bottom.inset(u), m, Font::Bold, 0, ui.theme.button_text);
     }
     let body = body.inset(u);
+    let money = |m: Money| format!("{}", m.display(v.cfg.decimals));
 
-    match &screen {
+    match &v.screen {
         Screen::Blank => {}
         Screen::Fatal(m) => {
             ui.c.fill_rect(body, ui.theme.danger);
-            ui.label(body.split_top(6 * u).0, "FATAL", Font::Large, 1);
-            ui.label(body, m, Font::Normal, 1);
+            let (t, r) = body.split_top(10 * u);
+            ui.label(t, "FATAL", Font::Large, 1);
+            ui.c.text_wrapped(r.inset(2 * u), m, Font::Normal, ui.theme.text);
         }
-        Screen::Prompt(p) => {
-            let (t, r) = body.split_top(8 * u);
-            ui.label(t, &p.title, Font::Large, 1);
-            let (h, r) = r.split_top(5 * u);
-            ui.label_color(h, &p.hint, Font::Normal, 1, ui.theme.muted);
-            let (f, r) = r.split_top(7 * u);
-            let fr = Rect::new(f.x + f.w / 4, f.y, f.w / 2, f.h);
-            ui.panel(fr);
-            let shown: String = if p.secret {
-                p.field.chars().map(|_| '*').collect()
-            } else {
-                p.field.clone()
-            };
-            ui.label(fr.inset(u), &format!("{shown}_"), Font::Large, 1);
-            // On-screen keypad for touch use.
-            let pad = Rect::new(r.x + r.w / 3, r.y + u, r.w / 3, r.h - u);
-            let keys = ["7", "8", "9", "4", "5", "6", "1", "2", "3", "<", "0", "OK"];
-            for (k, cell) in keys.iter().zip(pad.grid(3, 4, u)) {
-                let style = match *k {
-                    "OK" => ButtonStyle::Primary,
-                    "<" => ButtonStyle::Danger,
-                    _ => ButtonStyle::Normal,
-                };
-                if ui.button(cell, k, style) {
-                    action = Some(UiAction::Key(match *k {
-                        "OK" => Key::Enter,
-                        "<" => Key::Backspace,
-                        d => Key::Char(d.chars().next().unwrap_or('0')),
-                    }));
-                }
-            }
-        }
+        Screen::Prompt(p) => action = draw_prompt(&mut ui, body, p, &v.choices),
         Screen::Sale | Screen::Pay | Screen::Done { .. } => {
-            let (left, right) = body.split_left(body.w * 3 / 5);
-            let left = Rect::new(left.x, left.y, left.w - u, left.h);
-            // Cart lines.
-            ui.panel(left);
-            let (list, entry_r) = left.split_bottom(6 * u);
-            let row_h = ui.c.line_height(Font::Normal) + u;
-            let rows = (list.h / row_h).max(1) as usize;
-            let first = sel.unwrap_or(0).saturating_sub(rows.saturating_sub(1));
-            if let Some(p) = &priced {
-                for (k, (l, pl)) in cart
-                    .lines
-                    .iter()
-                    .zip(&p.lines)
-                    .enumerate()
-                    .skip(first)
-                    .take(rows)
-                {
-                    let r = Rect::new(list.x, list.y + (k - first) as i32 * row_h, list.w, row_h);
-                    let mut name = l.name.clone();
-                    if l.discount.is_some() {
-                        name.push_str(" (disc)");
-                    }
-                    if l.price_override {
-                        name.push_str(" (ovr)");
-                    }
-                    let cols = [
-                        (name.as_str(), list.w * 6 / 10, 0u8),
-                        (&*format!("{}", l.qty), list.w * 15 / 100, 2),
-                        (&*money(pl.total), list.w * 25 / 100, 2),
-                    ];
-                    if ui.row(r, &cols, sel == Some(k)) {
-                        action = Some(UiAction::Select(k));
-                    }
-                }
-            }
-            ui.c.fill_rect(entry_r, ui.theme.bg);
-            let q = pending_qty.map(|q| format!("{q} x ")).unwrap_or_default();
-            ui.label(entry_r.inset(u), &format!("> {q}{entry}_"), Font::Large, 0);
-
-            // Totals.
-            let (tot, rest) = right.split_top(14 * u);
-            ui.panel(tot);
-            if let Some(p) = &priced {
-                let t = &p.totals;
-                let (a, b) = tot.inset(u).split_top(4 * u);
-                ui.label(
-                    a,
-                    &format!("Items {}   Tax {}", cart.lines.len(), money(t.tax)),
-                    Font::Normal,
-                    0,
-                );
-                if !t.discount.is_zero() {
-                    ui.label(a, &format!("Disc -{}", money(t.discount)), Font::Normal, 2);
-                }
-                ui.label(
-                    b,
-                    &format!("{} {}", cfg.currency, money(t.total)),
-                    Font::Large,
-                    2,
-                );
-            }
-            let rest = Rect::new(rest.x, rest.y + u, rest.w, rest.h - u);
-            match &screen {
-                Screen::Pay => {
-                    if let Some(pay) = &payment {
-                        let (info, keys) = rest.split_top(16 * u);
-                        ui.panel(info);
-                        let mut y = info.y + u;
-                        let lh = ui.c.line_height(Font::Normal) + 4;
-                        let due = pay.cash_due(&cfg).unwrap_or(Money::ZERO);
-                        let mut lines = vec![
-                            format!(
-                                "Remaining: {}",
-                                money(pay.remaining().unwrap_or(Money::ZERO))
-                            ),
-                            format!("Cash due (rounded): {}", money(due)),
-                        ];
-                        for t in &pay.tenders {
-                            lines.push(format!(
-                                "{} {} {}",
-                                t.kind.label(),
-                                money(t.amount),
-                                t.reference
-                            ));
-                        }
-                        for l in lines {
-                            ui.label(
-                                Rect::new(info.x + u, y, info.w - 2 * u, lh),
-                                &l,
-                                Font::Normal,
-                                0,
-                            );
-                            y += lh;
-                        }
-                        let btns = [
-                            ("Cash F1", Key::F(1)),
-                            ("Card F2", Key::F(2)),
-                            ("Voucher F3", Key::F(3)),
-                            ("Back Esc", Key::Escape),
-                        ];
-                        for ((label, k), cell) in btns.iter().zip(keys.grid(2, 2, u)) {
-                            if ui.button(cell, label, ButtonStyle::Primary) {
-                                action = Some(UiAction::Key(*k));
-                            }
-                        }
-                    }
-                }
-                Screen::Done { change, receipt } => {
-                    ui.c.fill_rect(rest, ui.theme.ok);
-                    let (a, b) = rest.split_top(rest.h / 2);
-                    ui.label_color(
-                        a,
-                        &format!("Receipt #{receipt} saved"),
-                        Font::Normal,
-                        1,
-                        ui.theme.button_text,
-                    );
-                    ui.label_color(
-                        b,
-                        &format!("CHANGE {}", money(*change)),
-                        Font::Large,
-                        1,
-                        ui.theme.button_text,
-                    );
-                }
-                _ => {
-                    let (qk, fk) = rest.split_top(rest.h / 2);
-                    for ((sku, name), cell) in quick.iter().zip(qk.grid(4, 3, u / 2)) {
-                        if ui.button(cell, name, ButtonStyle::Normal) {
-                            action = Some(UiAction::Code(sku.clone()));
-                        }
-                    }
-                    let fns = [
-                        ("F1 Pay", ButtonStyle::Ok),
-                        ("F2 Find", ButtonStyle::Normal),
-                        ("F3 Qty", ButtonStyle::Normal),
-                        ("F4 Void ln", ButtonStyle::Danger),
-                        ("F5 Disc%", ButtonStyle::Normal),
-                        ("F6 Bskt%", ButtonStyle::Normal),
-                        ("F7 Price", ButtonStyle::Normal),
-                        ("F8 Void", ButtonStyle::Danger),
-                        ("F9 Refund", ButtonStyle::Normal),
-                        ("F10 Menu", ButtonStyle::Primary),
-                        ("F11 Drawer", ButtonStyle::Normal),
-                        ("F12 Exit", ButtonStyle::Normal),
-                    ];
-                    for (n, ((label, style), cell)) in
-                        fns.iter().zip(fk.grid(4, 3, u / 2)).enumerate()
-                    {
-                        if ui.button(cell, label, *style) {
-                            action = Some(UiAction::Key(Key::F(n as u8 + 1)));
-                        }
-                    }
-                }
-            }
+            action = draw_sale(&mut ui, body, &v, &money);
         }
         Screen::Search { query, sel } => {
-            let (t, list) = body.split_top(6 * u);
-            ui.label(t, &format!("Search: {query}_"), Font::Large, 0);
-            let row_h = ui.c.line_height(Font::Normal) + u;
-            for (k, (sku, name, price)) in search.iter().enumerate().take((list.h / row_h) as usize)
-            {
-                let r = Rect::new(list.x, list.y + k as i32 * row_h, list.w, row_h);
+            let (t, r) = body.split_top(7 * u);
+            ui.panel(t);
+            ui.label(t.inset(u), &format!("Find: {query}_"), Font::Large, 0);
+            let (list, kb) = r.split_bottom(r.h * 11 / 20);
+            let list = Rect::new(list.x, list.y + u, list.w, list.h - 2 * u);
+            let row_h = ui.c.line_height(Font::Normal) + 2 * u;
+            if v.search.is_empty() {
+                ui.label_color(list, "No matches", Font::Normal, 1, ui.theme.muted);
+            }
+            let rows = (list.h / row_h).max(1) as usize;
+            let first = sel.saturating_sub(rows - 1);
+            for (k, (sku, name, price)) in v.search.iter().enumerate().skip(first).take(rows) {
+                let r = Rect::new(list.x, list.y + (k - first) as i32 * row_h, list.w, row_h);
                 let cols = [
-                    (sku.as_str(), list.w / 4, 0u8),
-                    (name.as_str(), list.w / 2, 0),
-                    (price.as_str(), list.w / 4, 2),
+                    (name.as_str(), list.w * 55 / 100, 0u8),
+                    (sku.as_str(), list.w * 25 / 100, 0),
+                    (price.as_str(), list.w * 20 / 100, 2),
                 ];
                 if ui.row(r, &cols, k == *sel) {
                     action = Some(UiAction::Code(sku.clone()));
                 }
             }
+            if let Some(a) = keyboard(&mut ui, kb, Shift::Off, true) {
+                action = Some(a);
+            }
         }
         Screen::Menu { sel } => {
-            let (t, list) = body.split_top(6 * u);
+            let (t, r) = body.split_top(7 * u);
             ui.label(t, "Manager menu", Font::Large, 1);
-            let row_h = ui.c.line_height(Font::Normal) + u;
-            let list = Rect::new(list.x + list.w / 4, list.y, list.w / 2, list.h);
-            for (k, item) in MENU.iter().enumerate() {
-                let r = Rect::new(list.x, list.y + k as i32 * row_h, list.w, row_h);
-                let label = format!(
-                    "{}. {item}",
-                    if k < 9 {
-                        (k + 1).to_string()
-                    } else if k == 9 {
-                        "0".into()
-                    } else {
-                        " ".into()
-                    }
-                );
-                if ui.row(r, &[(label.as_str(), list.w, 0)], k == *sel) {
-                    action = Some(UiAction::Key(Key::Char(char::from(
-                        b'0' + ((k + 1) % 10) as u8,
-                    ))));
+            // Two columns of buttons; digits 1-9, 0 still pick from the keyboard.
+            let rows = (MENU.len() as i32 + 1) / 2;
+            let cell_h = (9 * u).min((r.h - u) / rows);
+            let grid = r.centered(r.w.min(120 * u), rows * cell_h);
+            let cells = grid.grid(2, rows, u / 2);
+            let labels: Vec<String> = MENU
+                .iter()
+                .enumerate()
+                .map(|(k, item)| match k {
+                    0..=8 => format!("{}. {item}", k + 1),
+                    9 => format!("0. {item}"),
+                    _ => (*item).to_string(),
+                })
+                .collect();
+            let font = ui
+                .grid_font(cells[0], labels.iter().map(String::as_str))
+                .min_bold();
+            for (k, (label, cell)) in labels.iter().zip(cells).enumerate() {
+                let style = if k == *sel {
+                    ButtonStyle::Primary
+                } else {
+                    ButtonStyle::Normal
+                };
+                if ui.button_font(cell, label, style, font) {
+                    action = Some(UiAction::Menu(k));
                 }
             }
         }
         Screen::Info { title, lines } => {
-            let (t, list) = body.split_top(6 * u);
+            let (t, r) = body.split_top(7 * u);
             ui.label(t, title, Font::Large, 1);
-            let lh = ui.c.line_height(Font::Normal) + 2;
-            let list = Rect::new(list.x + list.w / 5, list.y, list.w * 3 / 5, list.h);
+            let (list, btn) = r.split_bottom(9 * u);
+            let lh = ui.c.line_height(Font::Normal) + u / 2;
+            let h = (lines.len() as i32 * lh + 2 * u).min(list.h);
+            let list = Rect::new(list.x + list.w / 6, list.y, list.w * 4 / 6, h);
+            ui.panel(list);
+            let inner = list.inset(u);
             for (k, l) in lines.iter().enumerate() {
-                ui.label(
-                    Rect::new(list.x, list.y + k as i32 * lh, list.w, lh),
-                    l,
-                    Font::Normal,
-                    0,
-                );
+                let y = inner.y + k as i32 * lh;
+                if y + lh > inner.y + inner.h {
+                    break;
+                }
+                ui.label(Rect::new(inner.x, y, inner.w, lh), l, Font::Normal, 0);
             }
+            let b = btn.centered(30 * u, 7 * u);
+            if ui.button(b, "Continue", ButtonStyle::Primary) {
+                action = Some(UiAction::Key(Key::Enter));
+            }
+        }
+        Screen::RefundPick {
+            receipt,
+            sel,
+            picks,
+        } => {
+            let (t, r) = body.split_top(7 * u);
+            ui.label(
+                t,
+                &format!("Refund from receipt #{receipt}"),
+                Font::Large,
+                1,
+            );
+            let (list, btns) = r.split_bottom(9 * u);
             ui.label_color(
-                Rect::new(list.x, list.y + list.h - lh, list.w, lh),
-                "Enter to continue",
+                list.split_top(4 * u).0,
+                "Tap a line (or Enter) to set its refund quantity",
                 Font::Normal,
                 1,
                 ui.theme.muted,
             );
-        }
-        Screen::RefundPick { receipt, sel, .. } => {
-            let (t, list) = body.split_top(6 * u);
-            ui.label(
-                t,
-                &format!("Refund from receipt #{receipt}: Enter = set qty, F1 = continue"),
-                Font::Normal,
-                1,
-            );
-            let row_h = ui.c.line_height(Font::Normal) + u;
-            for (k, l) in refund_lines.iter().enumerate() {
+            let list = list.split_top(4 * u).1;
+            let row_h = ui.c.line_height(Font::Normal) + 2 * u;
+            for (k, l) in v.refund_lines.iter().enumerate() {
                 let r = Rect::new(list.x, list.y + k as i32 * row_h, list.w, row_h);
+                if r.y + r.h > list.y + list.h {
+                    break;
+                }
                 if ui.row(r, &[(l.as_str(), list.w, 0)], k == *sel) {
-                    action = Some(UiAction::Key(Key::Enter));
+                    action = Some(UiAction::RefundRow(k));
+                }
+            }
+            let cells = btns.centered(btns.w * 3 / 4, 7 * u).grid(3, 1, u);
+            let cont = if picks.is_empty() {
+                ButtonStyle::Disabled
+            } else {
+                ButtonStyle::Ok
+            };
+            let font = ui.grid_font(cells[0], ["Set quantity", "Continue", "Cancel"]);
+            if ui.button_font(cells[0], "Set quantity", ButtonStyle::Primary, font) {
+                action = Some(UiAction::Key(Key::Enter));
+            }
+            if ui.button_font(cells[1], "Continue", cont, font) {
+                action = Some(UiAction::Key(Key::F(1)));
+            }
+            if ui.button_font(cells[2], "Cancel", ButtonStyle::Normal, font) {
+                action = Some(UiAction::Key(Key::Escape));
+            }
+        }
+    }
+    let targets = core::mem::take(&mut ui.targets);
+    app.targets = targets;
+    action
+}
+
+fn draw_prompt(
+    ui: &mut Ui<'_>,
+    body: Rect,
+    p: &Prompt,
+    choice_items: &[(String, String)],
+) -> Option<UiAction> {
+    let u = ui.u();
+    let input = p.next.input();
+    let (t, r) = body.split_top(7 * u);
+    ui.label(t, &p.title, Font::Large, 1);
+    // Hints can be long (the damaged-store message): up to three lines.
+    let hint_h = 3 * ui.c.line_height(Font::Normal);
+    let (h, r) = r.split_top(hint_h);
+    let muted = ui.theme.muted;
+    ui.c.text_wrapped(h.centered(h.w * 4 / 5, h.h), &p.hint, Font::Normal, muted);
+    let (f, r) = r.split_top(ui.c.line_height(Font::Large) + 2 * u);
+    let fr = f.centered(f.w / 2, f.h);
+    ui.panel(fr);
+    let shown: String = if p.secret {
+        p.field.chars().map(|_| '•').collect()
+    } else {
+        p.field.clone()
+    };
+    ui.label(fr.inset(u), &format!("{shown}_"), Font::Large, 1);
+    let r = Rect::new(r.x, r.y + u, r.w, r.h - u);
+    if !choice_items.is_empty() {
+        let (grid, foot) = r.split_bottom(8 * u);
+        let mut action = choices(ui, grid, choice_items);
+        if p.next.cancellable() {
+            let b = foot.centered(24 * u, 6 * u);
+            if ui.button(b, "Cancel", ButtonStyle::Normal) {
+                action = Some(UiAction::Key(Key::Escape));
+            }
+        }
+        return action;
+    }
+    match input {
+        Input::Text => {
+            let kb = r.centered(r.w.min(110 * u), r.h);
+            keyboard(ui, kb, p.shift, p.next.cancellable())
+        }
+        Input::Digits | Input::Amount => {
+            let side = r.h.min(r.w / 2);
+            let pad = r.centered(side * 4 / 3, side);
+            let kind = if input == Input::Digits {
+                Pad::Digits
+            } else {
+                Pad::Amount
+            };
+            numpad(ui, pad, kind)
+        }
+    }
+}
+
+fn draw_sale(
+    ui: &mut Ui<'_>,
+    body: Rect,
+    v: &View,
+    money: &dyn Fn(Money) -> String,
+) -> Option<UiAction> {
+    let mut action = None;
+    let u = ui.u();
+    let done = match v.screen {
+        Screen::Done { change, receipt } => Some((change, receipt)),
+        _ => None,
+    };
+    let (left, right) = body.split_left(body.w * 3 / 5);
+    let left = Rect::new(left.x, left.y, left.w - u, left.h);
+
+    // ---- left: lines (the finished sale's lines on the Done screen)
+    ui.panel(left);
+    let (list, entry_r) = left.split_bottom(ui.c.line_height(Font::Large) + 3 * u);
+    let list = list.inset(u / 2);
+    let row_h = ui.c.line_height(Font::Normal) + u;
+    let rows = (list.h / row_h).max(1) as usize;
+    let mut lines: Vec<(String, String, String)> = Vec::new();
+    match (&done, &v.last_sale, &v.priced) {
+        (Some(_), Some(s), _) => {
+            for l in &s.lines {
+                lines.push((
+                    l.line.name.clone(),
+                    format!("{}", l.line.qty),
+                    money(l.priced.total),
+                ));
+            }
+        }
+        (None, _, Some(p)) => {
+            for (l, pl) in v.cart.lines.iter().zip(&p.lines) {
+                let mut name = l.name.clone();
+                if l.discount.is_some() {
+                    name.push_str(" (disc)");
+                }
+                if l.price_override {
+                    name.push_str(" (ovr)");
+                }
+                lines.push((name, format!("{}", l.qty), money(pl.total)));
+            }
+        }
+        _ => {}
+    }
+    let sel = if done.is_some() { None } else { v.sel };
+    let first = sel
+        .unwrap_or(lines.len().saturating_sub(1))
+        .saturating_sub(rows.saturating_sub(1));
+    for (k, (name, qty, total)) in lines.iter().enumerate().skip(first).take(rows) {
+        let r = Rect::new(list.x, list.y + (k - first) as i32 * row_h, list.w, row_h);
+        let cols = [
+            (name.as_str(), list.w * 6 / 10, 0u8),
+            (qty.as_str(), list.w * 15 / 100, 2),
+            (total.as_str(), list.w * 25 / 100, 2),
+        ];
+        if ui.row(r, &cols, sel == Some(k)) && done.is_none() {
+            action = Some(UiAction::Select(k));
+        }
+    }
+    if lines.is_empty() && done.is_none() {
+        ui.label_color(
+            list,
+            "Scan an item, tap a quick key, or type a code",
+            Font::Normal,
+            1,
+            ui.theme.muted,
+        );
+    }
+    ui.c.fill_rect(entry_r, ui.theme.bg);
+    match done {
+        Some((_, receipt)) => {
+            let ok = ui.theme.ok;
+            ui.label_color(
+                entry_r.inset(u),
+                &format!("✓ Receipt #{receipt} saved"),
+                Font::Large,
+                0,
+                ok,
+            );
+        }
+        None => {
+            let q = v.pending_qty.map(|q| format!("{q} × ")).unwrap_or_default();
+            ui.label(
+                entry_r.inset(u),
+                &format!("› {q}{}_", v.entry),
+                Font::Large,
+                0,
+            );
+        }
+    }
+
+    // ---- right: totals
+    let (tot, rest) = right.split_top(14 * u);
+    ui.panel(tot);
+    let totals = match (&done, &v.last_sale) {
+        (Some(_), Some(s)) => Some((s.lines.len(), s.totals.clone())),
+        (None, _) => v
+            .priced
+            .as_ref()
+            .map(|p| (v.cart.lines.len(), p.totals.clone())),
+        _ => None,
+    };
+    if let Some((n, t)) = totals {
+        let (a, b) = tot.inset(u).split_top(4 * u);
+        let muted = ui.theme.muted;
+        ui.label_color(
+            a,
+            &format!("Items {n}   Tax {}", money(t.tax)),
+            Font::Normal,
+            0,
+            muted,
+        );
+        if !t.discount.is_zero() {
+            ui.label_color(
+                a,
+                &format!("Disc −{}", money(t.discount)),
+                Font::Normal,
+                2,
+                muted,
+            );
+        }
+        ui.label(
+            b,
+            &format!("{} {}", v.cfg.currency, money(t.total)),
+            Font::Large,
+            2,
+        );
+    }
+    let rest = Rect::new(rest.x, rest.y + u, rest.w, rest.h - u);
+
+    match &v.screen {
+        Screen::Pay => {
+            let Some(pay) = &v.payment else {
+                return action;
+            };
+            let lh = ui.c.line_height(Font::Normal) + u / 2;
+            let n_lines = 2 + pay.tenders.len() as i32;
+            let (info, rest) = rest.split_top(n_lines * lh + 2 * u);
+            ui.panel(info);
+            let due = pay.cash_due(&v.cfg).unwrap_or(Money::ZERO);
+            let remaining = pay.remaining().unwrap_or(Money::ZERO);
+            let mut rows = vec![
+                ("Remaining".to_string(), money(remaining)),
+                ("Cash due (rounded)".to_string(), money(due)),
+            ];
+            for t in &pay.tenders {
+                rows.push((
+                    format!("{} {}", t.kind.label(), t.reference),
+                    money(t.amount),
+                ));
+            }
+            let inner = info.inset(u);
+            for (k, (l, a)) in rows.iter().enumerate() {
+                let r = Rect::new(inner.x, inner.y + k as i32 * lh, inner.w, lh);
+                ui.label(r, l, Font::Normal, 0);
+                ui.label(r, a, Font::Bold, 2);
+            }
+            let rest = Rect::new(rest.x, rest.y + u, rest.w, rest.h - u);
+            let (pad, tenders) = rest.split_bottom(8 * u);
+            if let Some(a) = numpad(ui, Rect::new(pad.x, pad.y, pad.w, pad.h - u), Pad::Pay) {
+                action = Some(a);
+            }
+            // Cash is the keypad's green key (Enter / F1).
+            let cells = tenders.grid(3, 1, u / 2);
+            let btns = [
+                ("Card (F2)", Key::F(2), ButtonStyle::Primary),
+                ("Voucher (F3)", Key::F(3), ButtonStyle::Primary),
+                ("Void sale (F8)", Key::F(8), ButtonStyle::Danger),
+            ];
+            let font = ui.grid_font(cells[0], btns.iter().map(|b| b.0));
+            for ((label, k, style), cell) in btns.into_iter().zip(cells) {
+                if ui.button_font(cell, label, style, font) {
+                    action = Some(UiAction::Key(k));
+                }
+            }
+        }
+        Screen::Done { change, .. } => {
+            ui.c.fill_round_rect(rest, ui.c.px(6), ui.theme.ok);
+            let inner = rest.inset(2 * u);
+            let white = ui.theme.button_text;
+            let lh = ui.c.line_height(Font::Bold) + u;
+            let big = ui.c.line_height(Font::Huge);
+            let mut rows: Vec<(String, String)> = Vec::new();
+            if let Some(s) = &v.last_sale {
+                rows.push(("Total".into(), money(s.totals.total)));
+                if !s.rounding.is_zero() {
+                    rows.push(("Cash rounding".into(), money(s.rounding)));
+                }
+                for t in &s.tenders {
+                    rows.push((t.kind.label().into(), money(t.amount)));
+                }
+            }
+            // Paid lines, then CHANGE and the amount, centred as one block.
+            let block_h = rows.len() as i32 * lh + 2 * u + lh + big;
+            let block = inner.centered(inner.w.min(50 * u), block_h);
+            let mut y = block.y;
+            for (l, a) in &rows {
+                let r = Rect::new(block.x, y, block.w, lh);
+                ui.label_color(r, l, Font::Normal, 0, white);
+                ui.label_color(r, a, Font::Bold, 2, white);
+                y += lh;
+            }
+            y += u;
+            ui.c.fill_rect(Rect::new(block.x, y, block.w, ui.c.px(2).max(1)), white);
+            y += u;
+            ui.label_color(
+                Rect::new(block.x, y, block.w, lh),
+                "CHANGE",
+                Font::Bold,
+                1,
+                white,
+            );
+            y += lh;
+            ui.label_color(
+                Rect::new(block.x, y, block.w, big),
+                &money(*change),
+                Font::Huge,
+                1,
+                white,
+            );
+            let hint = Rect::new(inner.x, inner.y + inner.h - lh, inner.w, lh);
+            ui.label_color(
+                hint,
+                "Tap or press any key for the next sale",
+                Font::Small,
+                1,
+                white,
+            );
+            if ui.target(rest, "Next sale") {
+                action = Some(UiAction::Key(Key::Escape));
+            }
+        }
+        _ => {
+            // Header: page arrows, page number, keypad toggle.
+            let (head, rest) = rest.split_top(6 * u);
+            let hc = head.grid(4, 1, u / 2);
+            let paged = v.qk_pages > 1 && !v.sale_pad;
+            let st = |on: bool| {
+                if on {
+                    ButtonStyle::Normal
+                } else {
+                    ButtonStyle::Disabled
+                }
+            };
+            let hf = ui.grid_font(hc[0], ["◀", "▶", "123", "Items"]);
+            if ui.button_font(hc[0], "◀", st(paged && v.qk_page > 0), hf) {
+                action = Some(UiAction::Page(-1));
+            }
+            let page_txt = if v.sale_pad {
+                "Keypad".to_string()
+            } else {
+                format!("Page {}/{}", v.qk_page + 1, v.qk_pages)
+            };
+            let muted = ui.theme.muted;
+            ui.label_color(hc[1], &page_txt, Font::Normal, 1, muted);
+            if ui.button_font(hc[2], "▶", st(paged && v.qk_page + 1 < v.qk_pages), hf) {
+                action = Some(UiAction::Page(1));
+            }
+            let (tl, ts) = if v.sale_pad {
+                ("Items", ButtonStyle::Primary)
+            } else {
+                ("123", ButtonStyle::Primary)
+            };
+            if ui.button_font(hc[3], tl, ts, hf) {
+                action = Some(UiAction::TogglePad);
+            }
+            let rest = Rect::new(rest.x, rest.y + u / 2, rest.w, rest.h - u / 2);
+            let (mid, fk) = rest.split_top(rest.h * 52 / 100);
+            let mid = Rect::new(mid.x, mid.y, mid.w, mid.h - u / 2);
+            if v.sale_pad {
+                if let Some(a) = numpad(ui, mid, Pad::Sale) {
+                    action = Some(a);
+                }
+            } else {
+                let cells = mid.grid(4, 3, u / 2);
+                let page: Vec<&(usize, String, String)> = v
+                    .quick
+                    .iter()
+                    .filter(|(pos, ..)| pos / QK_PER_PAGE == v.qk_page)
+                    .collect();
+                let font = ui.grid_font(cells[0], page.iter().map(|q| q.2.as_str()));
+                for (pos, sku, name) in page {
+                    let cell = cells[pos % QK_PER_PAGE];
+                    if ui.button_font(cell, name, ButtonStyle::Normal, font) {
+                        action = Some(UiAction::Code(sku.clone()));
+                    }
+                }
+            }
+            let fns = [
+                ("F1 Pay", ButtonStyle::Ok),
+                ("F2 Find", ButtonStyle::Normal),
+                ("F3 Qty", ButtonStyle::Normal),
+                ("F4 Void line", ButtonStyle::Danger),
+                ("F5 Line %", ButtonStyle::Normal),
+                ("F6 Sale %", ButtonStyle::Normal),
+                ("F7 Price", ButtonStyle::Normal),
+                ("F8 Void sale", ButtonStyle::Danger),
+                ("F9 Refund", ButtonStyle::Normal),
+                ("F10 Menu", ButtonStyle::Primary),
+                ("F11 Drawer", ButtonStyle::Normal),
+                ("F12 Sign out", ButtonStyle::Normal),
+            ];
+            let cells = fk.grid(4, 3, u / 2);
+            let font = ui.grid_font(cells[0], fns.iter().map(|f| f.0));
+            for (n, ((label, style), cell)) in fns.iter().zip(cells).enumerate() {
+                if ui.button_font(cell, label, *style, font) {
+                    action = Some(UiAction::Key(Key::F(n as u8 + 1)));
                 }
             }
         }
@@ -1949,10 +2627,10 @@ fn status_line<D: BlockDevice>(app: &App<D>, now: i64) -> String {
         .unwrap_or_else(|| "No shift".into());
     let (used, total) = app.store.as_ref().map(|s| s.usage()).unwrap_or((0, 1));
     let pct = used * 100 / total.max(1);
-    let printer = if app.printer_ok { "" } else { "  PRINTER!" };
-    let full = if pct >= 80 { "  EXPORT NEEDED" } else { "" };
+    let printer = if app.printer_ok { "" } else { "   PRINTER!" };
+    let full = if pct >= 80 { "   EXPORT NEEDED" } else { "" };
     format!(
-        "{}  |  {}  |  {}  |  {}  |  Journal {}%{}{}",
+        "{}   •   {}   •   {}   •   {}   •   Journal {}%{}{}",
         app.state.config.store_name,
         user,
         shift,

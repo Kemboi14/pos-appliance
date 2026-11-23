@@ -504,3 +504,229 @@ fn golden(name: &str, bytes: &[u8]) {
         std::fs::read(&p).unwrap_or_else(|_| panic!("missing {p:?}; run with UPDATE_GOLDEN=1"));
     assert!(want == bytes, "golden mismatch: {name}");
 }
+
+// ------------------------------------------------------------ touch only
+
+/// 14 quick keys: two pages of the 4×3 grid.
+const TOUCH_CATALOG: &str = "sku,barcode,plu,name,price,tax_code,weighable,quick_key\n\
+MILK,4006381333931,,Milk 1L,1.20,A,0,0\n\
+BREAD,96385074,,Bread,2.49,A,0,1\n\
+EGGS,,,Eggs (tray of 30),9.50,A,0,2\n\
+SUGAR,,,Sugar 2kg,3.10,A,0,3\n\
+RICE,,,Rice 5kg,8.00,A,0,4\n\
+TEA,,,Tea leaves 250g,2.20,A,0,5\n\
+OIL,,,Cooking oil 1L,4.40,A,0,6\n\
+SALT,,,Salt,0.60,A,0,7\n\
+FLOUR,,,Maize flour 2kg,2.90,A,0,8\n\
+SODA,,,Soda 500ml,1.00,A,0,9\n\
+WATER,,,Water 1L,0.80,A,0,10\n\
+JUICE,,,Juice,1.50,A,0,11\n\
+MATCH,,,Matches,0.20,A,0,12\n\
+CANDLE,,,Candles (pack of 6),1.80,A,0,13\n";
+
+impl Rig {
+    /// Tap the centre of the target labelled `label` (press, then release
+    /// 80 ms later), as a finger on the touch panel would.
+    fn tap<D: BlockDevice>(&mut self, app: &mut App<D>, label: &str) {
+        let r = app
+            .tap_targets()
+            .iter()
+            .find(|(_, l)| l == label)
+            .map(|(r, _)| *r)
+            .unwrap_or_else(|| {
+                let all: Vec<&String> = app.tap_targets().iter().map(|(_, l)| l).collect();
+                panic!("no target {label:?} on {:?}; have {all:?}", app.screen())
+            });
+        self.tap_at(app, r.x + r.w / 2, r.y + r.h / 2, 300_000);
+    }
+
+    fn tap_at<D: BlockDevice>(&mut self, app: &mut App<D>, x: i32, y: i32, gap_us: u64) {
+        for (pressed, gap) in [(true, gap_us), (false, 80_000)] {
+            self.t_us += gap;
+            let at = self.t_us;
+            app.handle(
+                InputEvent::Pointer {
+                    x: x as u32,
+                    y: y as u32,
+                    pressed,
+                    at_us: at,
+                },
+                &mut self.hw(),
+            );
+            app.render(&mut self.hw());
+        }
+        self.clock.0.set(self.clock.0.get() + 1);
+    }
+
+    fn taps<D: BlockDevice>(&mut self, app: &mut App<D>, labels: &[&str]) {
+        for l in labels {
+            self.tap(app, l);
+        }
+    }
+
+    /// Save the screen as a PPM under $POS_UI_SHOTS (if set), for review.
+    fn shot<D: BlockDevice>(&self, app: &App<D>, name: &str) {
+        let Ok(dir) = std::env::var("POS_UI_SHOTS") else {
+            return;
+        };
+        let c = app.canvas();
+        let mut out = format!("P6\n{} {}\n255\n", c.width(), c.height()).into_bytes();
+        for y in 0..c.height() {
+            for x in 0..c.width() {
+                let p = c.pixel(x, y).unwrap_or(0);
+                out.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
+            }
+        }
+        let path =
+            std::path::Path::new(&dir).join(format!("{name}_{}x{}.ppm", c.width(), c.height()));
+        std::fs::write(path, out).unwrap();
+    }
+}
+
+/// A whole day on a till with only a touch screen: setup with the on-screen
+/// keyboard, sign-in by name tile, quick keys over two pages, the keypad
+/// for quantities and tendered cash, search, a report, and a refund.
+fn touch_only_day(w: u32, h: u32) {
+    let mut rig = Rig::new();
+    rig.disp = Disp(w, h);
+    let (mut app, st) = App::boot_with(fresh_device(), KEY, w, h, fast_hasher());
+    assert_eq!(st, BootStatus::FirstRun);
+    app.render(&mut rig.hw());
+    rig.shot(&app, "t0_setup");
+
+    // Name: the shift is pre-set for the first letter only.
+    rig.taps(&mut app, &["A", "l", "i", "c", "e"]);
+    rig.shot(&app, "t1_keyboard");
+    rig.tap(&mut app, "OK");
+    rig.taps(
+        &mut app,
+        &["1", "2", "3", "4", "OK", "1", "2", "3", "4", "OK"],
+    );
+    assert!(app.message().unwrap_or("").contains("Manager created"));
+
+    // Sign in by tapping the name tile.
+    rig.shot(&app, "t2_login");
+    rig.tap(&mut app, "Alice (1)");
+    rig.taps(&mut app, &["1", "2", "3", "4", "OK"]);
+    rig.taps(&mut app, &["1", "0", "0", "OK"]); // float
+    assert!(matches!(app.screen(), Screen::Sale), "{:?}", app.screen());
+
+    // Import the catalog from the menu.
+    rig.media
+        .0
+        .insert("CATALOG.CSV".into(), TOUCH_CATALOG.as_bytes().to_vec());
+    rig.tap(&mut app, "F10 Menu");
+    rig.shot(&app, "t3_menu");
+    rig.tap(&mut app, "8. Import catalog from USB (CATALOG.CSV)");
+    assert_eq!(app.state().catalog.len(), 14, "{:?}", app.message());
+
+    // Quick keys on page 1, then page 2.
+    rig.tap(&mut app, "Bread");
+    rig.tap(&mut app, "Eggs (tray of 30)");
+    rig.shot(&app, "t4_sale");
+    rig.tap(&mut app, "▶");
+    rig.tap(&mut app, "Candles (pack of 6)");
+    rig.tap(&mut app, "◀");
+    // Quantity with the keypad: 3 × Milk.
+    rig.tap(&mut app, "123");
+    rig.shot(&app, "t5_keypad");
+    rig.taps(&mut app, &["3", "× Qty", "Items", "Milk 1L"]);
+    assert_eq!(app.cart().lines.len(), 4, "{:?}", app.message());
+    assert_eq!(app.cart().lines[3].qty, pos_core::Qty::units(3));
+
+    // A bounced second tap 40 ms later is ignored; a real second tap counts.
+    let r = app
+        .tap_targets()
+        .iter()
+        .find(|(_, l)| l == "Salt")
+        .map(|(r, _)| *r)
+        .unwrap_or_else(|| panic!("no Salt"));
+    rig.tap_at(&mut app, r.x + 10, r.y + 10, 300_000);
+    rig.tap_at(&mut app, r.x + 12, r.y + 10, 40_000);
+    assert_eq!(app.cart().lines.len(), 5, "bounce was not ignored");
+
+    // Search with the on-screen keyboard; tap the result.
+    rig.tap(&mut app, "F2 Find");
+    rig.taps(&mut app, &["s", "o", "d"]);
+    rig.shot(&app, "t6_search");
+    rig.tap(&mut app, "Soda 500ml SODA 1.00");
+    assert_eq!(app.cart().lines.len(), 6);
+    assert!(matches!(app.screen(), Screen::Sale));
+
+    // Pay: 2.49 + 9.50 + 1.80 + 3×1.20 + 0.60 + 1.00 = 18.99; tender 50.
+    let total = app.cart().price(&app.state().config).unwrap().totals.total;
+    assert_eq!(total.0, 18_99);
+    rig.tap(&mut app, "F1 Pay");
+    rig.taps(&mut app, &["5", "0"]);
+    rig.shot(&app, "t7_pay");
+    rig.tap(&mut app, "Cash");
+    match app.screen() {
+        Screen::Done { change, receipt } => {
+            assert_eq!(change.0, 31_01);
+            assert_eq!(*receipt, 1);
+        }
+        s => panic!("{s:?} {:?}", app.message()),
+    }
+    rig.shot(&app, "t8_done");
+    rig.tap(&mut app, "Next sale");
+    assert!(matches!(app.screen(), Screen::Sale));
+
+    // A report screen is left with its Continue button.
+    rig.tap(&mut app, "F10 Menu");
+    rig.tap(&mut app, "Journal status");
+    rig.shot(&app, "t9_info");
+    rig.tap(&mut app, "Continue");
+    assert!(matches!(app.screen(), Screen::Sale));
+
+    // Refund one Milk from receipt 1: tap the line, keypad, keyboard, choice.
+    rig.tap(&mut app, "F9 Refund");
+    rig.taps(&mut app, &["1", "OK"]);
+    let row = app
+        .tap_targets()
+        .iter()
+        .find(|(_, l)| l.starts_with("Milk 1L"))
+        .map(|(_, l)| l.clone())
+        .unwrap_or_else(|| panic!("no Milk row"));
+    rig.tap(&mut app, &row);
+    rig.taps(&mut app, &["1", "OK", "Continue"]);
+    rig.taps(&mut app, &["S", "p", "i", "l", "t", "OK"]);
+    rig.shot(&app, "t10_payout");
+    rig.tap(&mut app, "Cash");
+    let c = &app.state().shift.as_ref().unwrap().counters;
+    assert_eq!(c.refunds_total.0, 1_20, "{:?}", app.message());
+
+    // Sign out from the F-key grid.
+    rig.tap(&mut app, "F12 Sign out");
+    assert!(matches!(app.screen(), Screen::Prompt(_)));
+}
+
+#[test]
+fn touch_only_day_1024x768() {
+    touch_only_day(1024, 768);
+}
+
+#[test]
+fn touch_only_day_1280x800() {
+    touch_only_day(1280, 800);
+}
+
+#[test]
+fn touch_only_day_1920x1080() {
+    touch_only_day(1920, 1080);
+}
+
+/// A scan straight after a sale (on the change screen) is not lost: the
+/// first character no longer just dismisses the screen.
+#[test]
+fn scan_on_change_screen_starts_next_sale() {
+    let mut rig = Rig::new();
+    let (mut app, _) = boot(fresh_device());
+    bring_up(&mut rig, &mut app);
+    rig.scan(&mut app, "96385074");
+    rig.key(&mut app, Key::F(1), 100_000);
+    rig.key(&mut app, Key::Enter, 100_000);
+    assert!(matches!(app.screen(), Screen::Done { .. }));
+    rig.scan(&mut app, "96385074");
+    assert!(matches!(app.screen(), Screen::Sale));
+    assert_eq!(app.cart().lines.len(), 1, "{:?}", app.message());
+}
