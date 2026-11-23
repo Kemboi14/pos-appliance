@@ -304,7 +304,7 @@ impl Canvas {
     }
 
     /// Text aligned within `r`: `align` 0 = left, 1 = centre, 2 = right;
-    /// vertically centred. Truncated with `…` if it does not fit.
+    /// vertically centred. Truncated with `~` if it does not fit (the fonts have no `…`).
     pub fn text_in(&mut self, r: Rect, s: &str, font: Font, c: Rgb888, align: u8) {
         let (cw, ch) = font.cell();
         let cw = cw * self.scale;
@@ -314,7 +314,8 @@ impl Canvas {
         let shown: alloc::string::String = if n > max_chars && max_chars > 0 {
             s.chars()
                 .take(max_chars - 1)
-                .chain(core::iter::once('…'))
+                // '…' is not in the Latin-1/-15 fonts; '~' is.
+                .chain(core::iter::once('~'))
                 .collect()
         } else {
             s.into()
@@ -446,7 +447,11 @@ impl<'a> Ui<'a> {
         };
         self.c.fill_rect(r, bg);
         self.c.frame_rect(r, 1, self.theme.bg);
-        let font = if r.h >= 3 * Font::Normal.cell().1 * self.c.scale && label.chars().count() <= 6
+        // Large only when the label fits on one line at that size.
+        let large_w = label.chars().count() as i32 * Font::Large.cell().0 * self.c.scale;
+        let font = if r.h >= 3 * Font::Normal.cell().1 * self.c.scale
+            && label.chars().count() <= 6
+            && large_w <= r.inset(4).w
         {
             Font::Large
         } else {

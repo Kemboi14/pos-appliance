@@ -12,6 +12,7 @@ use sha2::Digest;
 pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 const EFI_TARGET: &str = "x86_64-unknown-uefi";
+const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const IMAGE_MIB: u64 = 256;
 const ESP_MIB: u64 = 64;
 
@@ -20,6 +21,10 @@ struct Flags {
     release: bool,
     debug_console: bool,
     headless: bool,
+    /// Tier B: Limine + pos-kernel instead of the UEFI application.
+    kernel: bool,
+    /// QEMU: all USB devices behind a hub.
+    hub: bool,
     keys: Option<PathBuf>,
 }
 
@@ -40,11 +45,14 @@ fn run(args: &[String]) -> Res<()> {
             "--release" => f.release = true,
             "--debug-console" => f.debug_console = true,
             "--headless" => f.headless = true,
+            "--kernel" => f.kernel = true,
+            "--hub" => f.hub = true,
             "--keys" => f.keys = Some(PathBuf::from(it.next().ok_or("--keys needs a dir")?)),
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
     match cmd {
+        "build" if f.kernel => build_kernel(&f).map(|_| ()),
         "build" => build_efi(&f).map(|_| ()),
         "image" => image(&f).map(|_| ()),
         "qemu" => {
@@ -57,29 +65,48 @@ fn run(args: &[String]) -> Res<()> {
                 qmp: None,
                 reset_vars: true,
                 secure_vars: None,
+                hub: f.hub,
+                media_unplugged: false,
             })?;
             child.wait()?;
             Ok(())
         }
         "smoke" => smoke(&f),
         "shot" => shot(&f),
-        "e2e" => e2e(),
+        "e2e" => e2e(f.kernel, f.hub),
         "keys" => keys(&keys_dir(&f)?),
+        "sign" if f.kernel => sign_kernel(&keys_dir(&f)?).map(|_| ()),
         "sign" => sign(&keys_dir(&f)?).map(|_| ()),
-        "sb-test" => sb_test(&keys_dir(&f)?),
+        "sb-test" => sb_test(&keys_dir(&f)?, f.kernel),
         "repro" => repro(),
         "test" => host_tests(),
         "lint" => lint(),
+        "tamper-test" => tamper_test(),
+        "key-test" => key_test(),
         "ci" => {
             lint()?;
             host_tests()?;
             smoke(&Flags::default())?;
-            e2e()?;
+            smoke(&Flags {
+                kernel: true,
+                ..Flags::default()
+            })?;
+            tamper_test()?;
+            key_test()?;
+            e2e(false, false)?;
+            e2e(true, true)?;
+            // Ephemeral keys: never sign test images with keys/ (which may
+            // hold the production db key).
+            let ci_keys = out_dir()?.join("ci-keys");
+            sb_test(&ci_keys, false)?;
+            sb_test(&ci_keys, true)?;
             repro()
         }
         _ => {
             eprintln!(
                 "usage: cargo xtask <cmd> [--release] [--debug-console] [--headless]\n\
+                 \n\
+                 --kernel (build/image/qemu/smoke/shot): Tier B, Limine + pos-kernel\n\
                  \n\
                  build    build BOOTX64.EFI into out/\n\
                  image    build out/pos.img (GPT: ESP + POS data partition)\n\
@@ -93,7 +120,9 @@ fn run(args: &[String]) -> Res<()> {
                  keys     generate Secure Boot PK/KEK/db (keys/, private keys git-ignored)\n\
                  sign     sign the release BOOTX64.EFI and build out/pos-signed.img\n\
                  sb-test  OVMF with Secure Boot enforced: signed boots, unsigned refused\n\
-                 ci       lint + test + smoke + e2e + repro"
+                 tamper-test  Tier B: modified kernel or limine.conf must not boot\n\
+                 key-test Tier B: stage 0 creates the store key, then hands it over\n\
+                 ci       lint, test, smoke/e2e/sb-test (A and B), tamper, key, repro"
             );
             Ok(())
         }
@@ -143,6 +172,17 @@ fn check_release_features(f: &Flags) -> Res<()> {
 }
 
 fn build_efi_in(f: &Flags, target_dir: &Path) -> Res<PathBuf> {
+    build_uefi_bin(f, target_dir, "platform-uefi", "pos-uefi", f.debug_console)
+}
+
+/// Build a UEFI application of this workspace (Tier A app or Tier B stage 0).
+fn build_uefi_bin(
+    f: &Flags,
+    target_dir: &Path,
+    pkg: &str,
+    bin: &str,
+    debug_console: bool,
+) -> Res<PathBuf> {
     check_release_features(f)?;
     let root = root()?;
     let home = std::env::var("CARGO_HOME")
@@ -158,13 +198,67 @@ fn build_efi_in(f: &Flags, target_dir: &Path) -> Res<PathBuf> {
         .env("CARGO_ENCODED_RUSTFLAGS", rustflags.replace(' ', "\x1f"))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("SOURCE_DATE_EPOCH", source_date_epoch().to_string())
+        .args(["build", "--locked", "-p", pkg, "--target", EFI_TARGET]);
+    if f.release {
+        cmd.arg("--release");
+    }
+    if debug_console {
+        cmd.args(["--features", "debug-console"]);
+    }
+    sh(&mut cmd)?;
+    let prof = if f.release { "release" } else { "debug" };
+    Ok(target_dir
+        .join(EFI_TARGET)
+        .join(prof)
+        .join(format!("{bin}.efi")))
+}
+
+fn build_efi(f: &Flags) -> Res<PathBuf> {
+    let efi = build_efi_in(f, &root()?.join("target"))?;
+    let out = out_dir()?.join("BOOTX64.EFI");
+    std::fs::copy(&efi, &out)?;
+    println!("BOOTX64.EFI sha256 {}", sha256_hex(&std::fs::read(&out)?));
+    Ok(out)
+}
+
+fn build_kernel(f: &Flags) -> Res<PathBuf> {
+    let built = build_kernel_in(f, &root()?.join("target"))?;
+    let out = out_dir()?.join("pos-kernel");
+    std::fs::copy(&built, &out)?;
+    println!("pos-kernel sha256 {}", sha256_hex(&std::fs::read(&out)?));
+    Ok(out)
+}
+
+fn build_kernel_in(f: &Flags, target_dir: &Path) -> Res<PathBuf> {
+    check_release_features(f)?;
+    let root = root()?;
+    let home = std::env::var("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cargo")))?;
+    let rustflags = format!(
+        "--remap-path-prefix={}=/cargo --remap-path-prefix={}=/build \
+         -C relocation-model=static -C code-model=kernel",
+        home.display(),
+        root.display()
+    );
+    let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.current_dir(&root)
+        .env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            rustflags
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("\x1f"),
+        )
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("SOURCE_DATE_EPOCH", source_date_epoch().to_string())
         .args([
             "build",
             "--locked",
             "-p",
-            "platform-uefi",
+            "pos-kernel",
             "--target",
-            EFI_TARGET,
+            KERNEL_TARGET,
         ]);
     if f.release {
         cmd.arg("--release");
@@ -174,15 +268,214 @@ fn build_efi_in(f: &Flags, target_dir: &Path) -> Res<PathBuf> {
     }
     sh(&mut cmd)?;
     let prof = if f.release { "release" } else { "debug" };
-    Ok(target_dir.join(EFI_TARGET).join(prof).join("pos-uefi.efi"))
+    Ok(target_dir.join(KERNEL_TARGET).join(prof).join("pos-kernel"))
 }
 
-fn build_efi(f: &Flags) -> Res<PathBuf> {
-    let efi = build_efi_in(f, &root()?.join("target"))?;
-    let out = out_dir()?.join("BOOTX64.EFI");
-    std::fs::copy(&efi, &out)?;
-    println!("BOOTX64.EFI sha256 {}", sha256_hex(&std::fs::read(&out)?));
+/// Limine config: boot the kernel immediately, no menu, no entry editor.
+/// The kernel path is pinned by its BLAKE2B hash, and the config's own
+/// hash is enrolled into LIMINE.EFI (`limine enroll-config`), so neither
+/// can be changed without breaking the signature on LIMINE.EFI.
+fn limine_conf(kernel_b2: &str) -> String {
+    format!(
+        "timeout: 0\neditor_enabled: no\n\n/POS appliance\n    protocol: limine\n    \
+         path: boot():/boot/pos-kernel#{kernel_b2}\n"
+    )
+}
+
+/// The Tier B ESP contents.
+#[derive(Debug)]
+struct KernelParts {
+    stage0: Vec<u8>,
+    limine: Vec<u8>,
+    conf: String,
+    kernel: Vec<u8>,
+}
+
+impl KernelParts {
+    fn esp(&self) -> [(&str, &[u8]); 4] {
+        [
+            ("EFI/BOOT/BOOTX64.EFI", &self.stage0),
+            ("EFI/BOOT/LIMINE.EFI", &self.limine),
+            ("limine.conf", self.conf.as_bytes()),
+            ("boot/pos-kernel", &self.kernel),
+        ]
+    }
+}
+
+/// Copy Limine's EFI image and enroll `conf`'s BLAKE2B hash into it.
+fn enrolled_limine(conf: &str, out: &Path) -> Res<Vec<u8>> {
+    let limine_dir = std::env::var_os("LIMINE_DIR")
+        .map(PathBuf::from)
+        .ok_or("LIMINE_DIR not set; run inside `nix develop` (see flake.nix)")?;
+    let _ = std::fs::remove_file(out);
+    std::fs::write(out, std::fs::read(limine_dir.join("BOOTX64.EFI"))?)?;
+    run_ok(Command::new("limine").args([
+        "enroll-config",
+        "--quiet",
+        &out.display().to_string(),
+        &blake2b_hex(conf.as_bytes())?,
+    ]))?;
+    Ok(std::fs::read(out)?)
+}
+
+fn kernel_parts_in(f: &Flags, target_dir: &Path, work: &Path) -> Res<KernelParts> {
+    let kernel = std::fs::read(build_kernel_in(f, target_dir)?)?;
+    let stage0 = std::fs::read(build_uefi_bin(
+        f,
+        target_dir,
+        "pos-stage0",
+        "pos-stage0",
+        false,
+    )?)?;
+    let conf = limine_conf(&blake2b_hex(&kernel)?);
+    let limine = enrolled_limine(&conf, &work.join("LIMINE.EFI"))?;
+    Ok(KernelParts {
+        stage0,
+        limine,
+        conf,
+        kernel,
+    })
+}
+
+fn kernel_parts(f: &Flags) -> Res<KernelParts> {
+    let p = kernel_parts_in(f, &root()?.join("target"), &out_dir()?)?;
+    std::fs::write(out_dir()?.join("pos-kernel"), &p.kernel)?;
+    println!("pos-kernel sha256 {}", sha256_hex(&p.kernel));
+    Ok(p)
+}
+
+fn kernel_image(f: &Flags) -> Res<PathBuf> {
+    let p = kernel_parts(f)?;
+    let out = out_dir()?.join("pos-kernel.img");
+    make_image_with(&p.esp(), &out)?;
+    println!(
+        "pos-kernel.img sha256 {}",
+        sha256_hex(&std::fs::read(&out)?)
+    );
     Ok(out)
+}
+
+/// Boot `esp` and require that the POS UI never appears.
+fn expect_no_boot(esp: &[(&str, &[u8])], name: &str, secure_vars: Option<PathBuf>) -> Res<()> {
+    let out = out_dir()?;
+    let img = out.join(format!("{name}.img"));
+    make_image_with(esp, &img)?;
+    let qmp_path = out.join("qmp.sock");
+    let mut child = qemu::spawn(&qemu::QemuOpts {
+        image: img,
+        media: None,
+        out_dir: out.clone(),
+        headless: true,
+        qmp: Some(qmp_path.clone()),
+        reset_vars: true,
+        secure_vars,
+        hub: false,
+        media_unplugged: false,
+    })?;
+    let res = (|| -> Res<bool> {
+        let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
+        let booted = wait_ui(&mut q, &out, Duration::from_secs(25)).is_ok();
+        let _ = std::fs::copy(out.join("ui.ppm"), out.join(format!("{name}.ppm")));
+        q.quit()?;
+        Ok(booted)
+    })();
+    stop_qemu(&mut child);
+    if res? {
+        return Err(format!("{name}: booted to the POS UI but must not").into());
+    }
+    Ok(())
+}
+
+/// Tier B boot integrity without Secure Boot: Limine must refuse (a) a
+/// kernel that differs by one byte from the hash in limine.conf and (b) a
+/// limine.conf that differs from the hash enrolled in LIMINE.EFI.
+fn tamper_test() -> Res<()> {
+    let p = kernel_parts(&Flags::default())?;
+    let mut bad_kernel = p.kernel.clone();
+    let i = bad_kernel.len() / 2;
+    bad_kernel[i] ^= 0x01;
+    let mut esp = p.esp();
+    esp[3].1 = &bad_kernel;
+    expect_no_boot(&esp, "tamper-kernel", None)?;
+    println!("tamper-test: modified kernel refused (kernel hash in limine.conf)");
+
+    // An attacker who swaps the kernel and rewrites the hash in the config.
+    let bad_conf = limine_conf(&blake2b_hex(&bad_kernel)?);
+    let mut esp = p.esp();
+    esp[2].1 = bad_conf.as_bytes();
+    esp[3].1 = &bad_kernel;
+    expect_no_boot(&esp, "tamper-conf", None)?;
+    println!("tamper-test: OK - modified limine.conf refused (config hash enrolled in LIMINE.EFI)");
+    Ok(())
+}
+
+/// Tier B key handover: stage 0 creates the NVRAM key on first boot and
+/// reuses it on the next (debug build, read from the kernel log).
+fn key_test() -> Res<()> {
+    let f = Flags {
+        kernel: true,
+        debug_console: true,
+        ..Flags::default()
+    };
+    let img = image(&f)?;
+    let out = out_dir()?;
+    let qmp_path = out.join("qmp.sock");
+    let mut seen = Vec::new();
+    for reset_vars in [true, false] {
+        let mut child = qemu::spawn(&qemu::QemuOpts {
+            image: img.clone(),
+            media: None,
+            out_dir: out.clone(),
+            headless: true,
+            qmp: Some(qmp_path.clone()),
+            reset_vars,
+            secure_vars: None,
+            hub: false,
+            media_unplugged: false,
+        })?;
+        let r = (|| -> Res<()> {
+            let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
+            wait_ui(&mut q, &out, Duration::from_secs(90))?;
+            q.quit()
+        })();
+        stop_qemu(&mut child);
+        r?;
+        let log = String::from_utf8_lossy(&std::fs::read(out.join("console.log"))?).into_owned();
+        let src = [
+            "key Generated",
+            "key Existing",
+            "key Fallback",
+            "key Missing",
+        ]
+        .into_iter()
+        .find(|k| log.contains(k))
+        .ok_or("key-test: no key line in the kernel log")?;
+        seen.push(src);
+    }
+    if seen != ["key Generated", "key Existing"] {
+        return Err(format!("key-test: expected Generated then Existing, got {seen:?}").into());
+    }
+    println!("key-test: OK - stage 0 created the NVRAM key, then handed the same key over");
+    Ok(())
+}
+
+/// BLAKE2B-512 via coreutils `b2sum` (in every Nix/Linux environment).
+fn blake2b_hex(data: &[u8]) -> Res<String> {
+    use std::io::Write;
+    let mut child = Command::new("b2sum")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    child.stdin.take().ok_or("b2sum stdin")?.write_all(data)?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err("b2sum failed".into());
+    }
+    let s = String::from_utf8(out.stdout)?;
+    Ok(s.split_whitespace()
+        .next()
+        .ok_or("b2sum output")?
+        .to_string())
 }
 
 /// Two blank, unbound superblocks (pos-store format). The device binds the
@@ -194,11 +487,15 @@ fn data_partition_init() -> Res<Vec<u8>> {
 }
 
 fn make_image(efi: &[u8], out: &Path) -> Res<()> {
+    make_image_with(&[("EFI/BOOT/BOOTX64.EFI", efi)], out)
+}
+
+fn make_image_with(esp_files: &[(&str, &[u8])], out: &Path) -> Res<()> {
     let l = image::build_image(
         out,
         IMAGE_MIB,
         ESP_MIB,
-        efi,
+        esp_files,
         &data_partition_init()?,
         source_date_epoch(),
     )?;
@@ -215,6 +512,9 @@ fn make_image(efi: &[u8], out: &Path) -> Res<()> {
 }
 
 fn image(f: &Flags) -> Res<PathBuf> {
+    if f.kernel {
+        return kernel_image(f);
+    }
     let efi_path = build_efi(f)?;
     let efi = std::fs::read(&efi_path)?;
     let out = out_dir()?.join("pos.img");
@@ -236,6 +536,10 @@ fn host_tests() -> Res<()> {
         "--workspace",
         "--exclude",
         "platform-uefi",
+        "--exclude",
+        "pos-kernel",
+        "--exclude",
+        "pos-stage0",
     ]))
 }
 
@@ -250,6 +554,10 @@ fn lint() -> Res<()> {
         "--workspace",
         "--exclude",
         "platform-uefi",
+        "--exclude",
+        "pos-kernel",
+        "--exclude",
+        "pos-stage0",
         "--all-targets",
         "--",
         "-D",
@@ -278,6 +586,31 @@ fn lint() -> Res<()> {
         "--",
         "-D",
         "warnings",
+    ]))?;
+    for feats in [&[][..], &["--features", "debug-console"][..]] {
+        sh(Command::new("cargo")
+            .current_dir(&r)
+            .args([
+                "clippy",
+                "--locked",
+                "-p",
+                "pos-kernel",
+                "--target",
+                KERNEL_TARGET,
+            ])
+            .args(feats)
+            .args(["--", "-D", "warnings"]))?;
+    }
+    sh(Command::new("cargo").current_dir(&r).args([
+        "clippy",
+        "--locked",
+        "-p",
+        "pos-stage0",
+        "--target",
+        EFI_TARGET,
+        "--",
+        "-D",
+        "warnings",
     ]))
 }
 
@@ -295,6 +628,8 @@ fn smoke(f: &Flags) -> Res<()> {
         qmp: Some(qmp_path.clone()),
         reset_vars: true,
         secure_vars: None,
+        hub: f.hub,
+        media_unplugged: false,
     })?;
     let res = (|| -> Res<()> {
         let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
@@ -345,10 +680,25 @@ fn repro() -> Res<()> {
         let efi = std::fs::read(build_efi_in(&f, &td)?)?;
         let img = tmp.join(format!("pos{i}.img"));
         make_image(&efi, &img)?;
-        hashes.push((sha256_hex(&efi), sha256_hex(&std::fs::read(&img)?)));
+        // Tier B: stage 0 + enrolled Limine + kernel.
+        let parts = kernel_parts_in(&f, &td, &tmp)?;
+        let kimg = tmp.join(format!("pos-kernel{i}.img"));
+        make_image_with(&parts.esp(), &kimg)?;
+        hashes.push((
+            sha256_hex(&efi),
+            sha256_hex(&std::fs::read(&img)?),
+            sha256_hex(&std::fs::read(&kimg)?),
+        ));
     }
-    println!("build 1: efi {} img {}", hashes[0].0, hashes[0].1);
-    println!("build 2: efi {} img {}", hashes[1].0, hashes[1].1);
+    for (i, h) in hashes.iter().enumerate() {
+        println!(
+            "build {}: efi {} img {} kernel img {}",
+            i + 1,
+            h.0,
+            h.1,
+            h.2
+        );
+    }
     if hashes[0] != hashes[1] {
         return Err("repro: builds differ".into());
     }
@@ -382,6 +732,8 @@ fn shot(f: &Flags) -> Res<()> {
         qmp: Some(qmp_path.clone()),
         reset_vars: true,
         secure_vars: None,
+        hub: f.hub,
+        media_unplugged: false,
     })?;
     let res = (|| -> Res<()> {
         let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
@@ -411,16 +763,18 @@ BREAD,96385074,,Bread,2.49,A,0,1\r\n";
 /// then check on the host: journal CSV has a gap-free receipt sequence that
 ///   includes receipt 1, its hash chain column is populated, and the printer
 ///   capture holds receipt #1.
-fn e2e() -> Res<()> {
+fn e2e(kernel: bool, hub: bool) -> Res<()> {
     // E2E_DEBUG=1 runs a debug build with the serial debug console.
     let f = if std::env::var_os("E2E_DEBUG").is_some() {
         Flags {
             debug_console: true,
+            kernel,
             ..Flags::default()
         }
     } else {
         Flags {
             release: true,
+            kernel,
             ..Flags::default()
         }
     };
@@ -435,7 +789,8 @@ fn e2e() -> Res<()> {
     )?;
     let qmp_path = out.join("qmp.sock");
     let human = Duration::from_millis(120);
-    let opts = |reset_vars| qemu::QemuOpts {
+    // Tier B: boot 1 starts without the export stick and hot-plugs it.
+    let opts = |reset_vars: bool| qemu::QemuOpts {
         image: img.clone(),
         media: Some(media.clone()),
         out_dir: out.clone(),
@@ -443,6 +798,8 @@ fn e2e() -> Res<()> {
         qmp: Some(qmp_path.clone()),
         reset_vars,
         secure_vars: None,
+        hub,
+        media_unplugged: kernel && reset_vars,
     };
     let pause = |ms| std::thread::sleep(Duration::from_millis(ms));
 
@@ -461,6 +818,10 @@ fn e2e() -> Res<()> {
         q.screendump(&out.join("e2e_0_login.ppm"))?;
         q.type_str("100.00\n", human)?;
         pause(500);
+        if kernel {
+            q.plug_media(hub)?;
+            pause(3000);
+        }
         q.key("f10", &[])?;
         pause(300);
         q.type_str("8", human)?; // import catalog
@@ -662,6 +1023,58 @@ fn keys(dir: &Path) -> Res<()> {
 }
 
 /// Sign the release EFI with db and build out/pos-signed.img.
+/// sbsign `input` with the db key into `output`, then sbverify it.
+fn sign_file(dir: &Path, input: &Path, output: &Path) -> Res<()> {
+    let _ = std::fs::remove_file(output);
+    run_ok(Command::new("sbsign").args([
+        "--key",
+        &dir.join("db.key").display().to_string(),
+        "--cert",
+        &dir.join("db.crt").display().to_string(),
+        "--output",
+        &output.display().to_string(),
+        &input.display().to_string(),
+    ]))?;
+    run_ok(Command::new("sbverify").args([
+        "--cert",
+        &dir.join("db.crt").display().to_string(),
+        &output.display().to_string(),
+    ]))
+}
+
+/// Tier B release image with stage 0 and the config-enrolled Limine both
+/// signed with the db key.
+fn sign_kernel(dir: &Path) -> Res<(PathBuf, KernelParts)> {
+    if !dir.join("db.key").exists() {
+        return Err(format!("no keys in {}; run `cargo xtask keys` first", dir.display()).into());
+    }
+    let mut p = kernel_parts(&Flags {
+        release: true,
+        kernel: true,
+        ..Flags::default()
+    })?;
+    let out = out_dir()?;
+    let (s0, s0s) = (out.join("STAGE0.EFI"), out.join("STAGE0.signed.EFI"));
+    let (li, lis) = (out.join("LIMINE.EFI"), out.join("LIMINE.signed.EFI"));
+    std::fs::write(&s0, &p.stage0)?;
+    std::fs::write(&li, &p.limine)?;
+    sign_file(dir, &s0, &s0s)?;
+    sign_file(dir, &li, &lis)?;
+    let unsigned = KernelParts {
+        stage0: std::mem::replace(&mut p.stage0, std::fs::read(&s0s)?),
+        limine: std::mem::replace(&mut p.limine, std::fs::read(&lis)?),
+        conf: p.conf.clone(),
+        kernel: p.kernel.clone(),
+    };
+    let img = out.join("pos-kernel-signed.img");
+    make_image_with(&p.esp(), &img)?;
+    println!(
+        "pos-kernel-signed.img sha256 {}",
+        sha256_hex(&std::fs::read(&img)?)
+    );
+    Ok((img, unsigned))
+}
+
 fn sign(dir: &Path) -> Res<PathBuf> {
     if !dir.join("db.key").exists() {
         return Err(format!("no keys in {}; run `cargo xtask keys` first", dir.display()).into());
@@ -672,21 +1085,7 @@ fn sign(dir: &Path) -> Res<PathBuf> {
     })?;
     let out = out_dir()?;
     let signed = out.join("BOOTX64.signed.EFI");
-    let _ = std::fs::remove_file(&signed);
-    run_ok(Command::new("sbsign").args([
-        "--key",
-        &dir.join("db.key").display().to_string(),
-        "--cert",
-        &dir.join("db.crt").display().to_string(),
-        "--output",
-        &signed.display().to_string(),
-        &efi.display().to_string(),
-    ]))?;
-    run_ok(Command::new("sbverify").args([
-        "--cert",
-        &dir.join("db.crt").display().to_string(),
-        &signed.display().to_string(),
-    ]))?;
+    sign_file(dir, &efi, &signed)?;
     let img = out.join("pos-signed.img");
     make_image(&std::fs::read(&signed)?, &img)?;
     println!(
@@ -703,9 +1102,16 @@ fn sign(dir: &Path) -> Res<PathBuf> {
 /// Enroll our PK/KEK/db (no Microsoft keys) into a Secure Boot OVMF
 /// varstore with enforcement on; the signed image must boot to the POS UI,
 /// the unsigned one must be refused by the firmware.
-fn sb_test(dir: &Path) -> Res<()> {
+fn sb_test(dir: &Path, kernel: bool) -> Res<()> {
     keys(dir)?;
-    let signed = sign(dir)?;
+    let mut kernel_unsigned = None;
+    let signed = if kernel {
+        let (img, unsigned) = sign_kernel(dir)?;
+        kernel_unsigned = Some(unsigned);
+        img
+    } else {
+        sign(dir)?
+    };
     let out = out_dir()?;
     let guid = std::fs::read_to_string(dir.join("GUID.txt"))?
         .trim()
@@ -737,6 +1143,8 @@ fn sb_test(dir: &Path) -> Res<()> {
         qmp: Some(qmp_path.clone()),
         reset_vars: true,
         secure_vars: Some(vars.clone()),
+        hub: false,
+        media_unplugged: false,
     };
     // Signed: must reach the UI.
     let mut child = qemu::spawn(&opts(signed))?;
@@ -748,6 +1156,18 @@ fn sb_test(dir: &Path) -> Res<()> {
     stop_qemu(&mut child);
     r.map_err(|e| format!("sb-test: signed image did not boot: {e}"))?;
     println!("sb-test: signed image boots with Secure Boot enforced");
+    if let Some(u) = kernel_unsigned {
+        // Signed stage 0 chaining to an unsigned Limine: the firmware must
+        // refuse LoadImage. Then an unsigned stage 0.
+        let signed_stage0 = std::fs::read(out.join("STAGE0.signed.EFI"))?;
+        let mut esp = u.esp();
+        esp[0].1 = &signed_stage0;
+        expect_no_boot(&esp, "sb-unsigned-limine", Some(vars.clone()))?;
+        println!("sb-test: signed stage 0 refused to run an unsigned LIMINE.EFI");
+        expect_no_boot(&u.esp(), "sb-unsigned-stage0", Some(vars.clone()))?;
+        println!("sb-test: unsigned stage 0 refused");
+        return Ok(());
+    }
     // Unsigned: must NOT reach the UI.
     let unsigned = out.join("pos-unsigned.img");
     make_image(

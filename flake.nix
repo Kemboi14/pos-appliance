@@ -20,11 +20,14 @@
           openssl
           python3
           socat
+          limine          # Tier B bootloader (BOOTX64.EFI)
+          dosfstools      # fsck.fat for the FAT driver tests
         ];
         OVMF_CODE = "${pkgs.OVMF.fd}/FV/OVMF_CODE.fd";
         OVMF_VARS = "${pkgs.OVMF.fd}/FV/OVMF_VARS.fd";
         OVMF_SB_CODE = "${pkgs.OVMFFull.fd}/FV/OVMF_CODE.fd";
         OVMF_SB_VARS = "${pkgs.OVMFFull.fd}/FV/OVMF_VARS.fd";
+        LIMINE_DIR = "${pkgs.limine}/share/limine";
         shellHook = ''
           export SOURCE_DATE_EPOCH=''${SOURCE_DATE_EPOCH:-1700000000}
         '';

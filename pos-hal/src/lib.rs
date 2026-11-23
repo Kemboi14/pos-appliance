@@ -269,6 +269,26 @@ pub trait BlockDevice {
     fn flush(&mut self) -> HalResult<()>;
 }
 
+/// Lets a borrowed device be used wherever an owned one is expected
+/// (partition windows, filesystems over a device the caller keeps).
+impl<D: BlockDevice + ?Sized> BlockDevice for &mut D {
+    fn block_size(&self) -> usize {
+        (**self).block_size()
+    }
+    fn block_count(&self) -> u64 {
+        (**self).block_count()
+    }
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> HalResult<()> {
+        (**self).read(lba, buf)
+    }
+    fn write(&mut self, lba: u64, buf: &[u8]) -> HalResult<()> {
+        (**self).write(lba, buf)
+    }
+    fn flush(&mut self) -> HalResult<()> {
+        (**self).flush()
+    }
+}
+
 /// External removable media with a FAT filesystem, used for CSV export and
 /// catalog import. Paths are flat file names in the volume root.
 pub trait ExternalMedia {

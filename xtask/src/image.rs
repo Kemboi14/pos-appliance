@@ -124,14 +124,14 @@ pub fn build_fat(
     Ok(buf.into_inner())
 }
 
-/// Create `out` with a protective MBR, GPT, ESP (with `efi` as
-/// `\EFI\BOOT\BOOTX64.EFI`) and the data partition, whose first sectors are
+/// Create `out` with a protective MBR, GPT, ESP (holding `esp_files`, e.g.
+/// `EFI/BOOT/BOOTX64.EFI`) and the data partition, whose first sectors are
 /// initialised with `data_init` (pre-formatted store).
 pub fn build_image(
     out: &Path,
     total_mib: u64,
     esp_mib: u64,
-    efi: &[u8],
+    esp_files: &[(&str, &[u8])],
     data_init: &[u8],
     epoch: i64,
 ) -> Res<Layout> {
@@ -191,7 +191,7 @@ pub fn build_image(
         l.esp_sectors * SECTOR,
         b"POS-ESP    ",
         0x504F_5345,
-        &[("EFI/BOOT/BOOTX64.EFI", efi)],
+        esp_files,
         epoch,
     )?;
     file.seek(SeekFrom::Start(l.esp_first * SECTOR))?;

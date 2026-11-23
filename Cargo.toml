@@ -7,7 +7,10 @@ members = [
     "pos-ui",
     "pos-escpos",
     "pos-app",
+    "pos-drivers",
     "platform-uefi",
+    "kernel",
+    "stage0",
     "xtask",
 ]
 # Host-testable crates. The firmware/kernel binaries are built by xtask with
@@ -19,6 +22,7 @@ default-members = [
     "pos-ui",
     "pos-escpos",
     "pos-app",
+    "pos-drivers",
     "xtask",
 ]
 
@@ -36,6 +40,7 @@ pos-store = { path = "pos-store" }
 pos-ui = { path = "pos-ui" }
 pos-escpos = { path = "pos-escpos" }
 pos-app = { path = "pos-app" }
+pos-drivers = { path = "pos-drivers" }
 
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "alloc"] }
 postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }

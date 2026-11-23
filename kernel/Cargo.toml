@@ -1,0 +1,29 @@
+[package]
+name = "pos-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "pos-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+default = []
+# Kernel log on COM1. Never enabled in release images (xtask rejects it).
+debug-console = []
+
+[dependencies]
+pos-hal.workspace = true
+pos-app.workspace = true
+pos-ui.workspace = true
+pos-store.workspace = true
+pos-drivers.workspace = true
+linked_list_allocator = "=0.10.6"

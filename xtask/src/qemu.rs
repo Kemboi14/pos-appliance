@@ -19,6 +19,11 @@ pub struct QemuOpts {
     pub reset_vars: bool,
     /// Use the Secure Boot (SMM) OVMF build with this pre-enrolled varstore.
     pub secure_vars: Option<PathBuf>,
+    /// Put every USB device behind a usb-hub (exercises hub support).
+    pub hub: bool,
+    /// Define the media drive but leave it unplugged; plug it later with
+    /// [`Qmp::plug_media`].
+    pub media_unplugged: bool,
 }
 
 fn env_path(var: &str) -> Res<PathBuf> {
@@ -70,21 +75,40 @@ pub fn spawn(o: &QemuOpts) -> Res<Child> {
     ));
     // No network devices at all: the appliance is offline by design.
     cmd.args(["-nic", "none"]);
-    cmd.args(["-device", "qemu-xhci,id=xhci"]);
-    cmd.args(["-device", "usb-kbd,bus=xhci.0"]);
-    cmd.args(["-device", "usb-tablet,bus=xhci.0"]);
+    // Enough root ports for every device, so QEMU does not insert a hub.
+    cmd.args(["-device", "qemu-xhci,id=xhci,p2=8,p3=8"]);
+    let at = |n: u8| {
+        if o.hub {
+            format!(",port=1.{n}")
+        } else {
+            String::new()
+        }
+    };
+    if o.hub {
+        cmd.args(["-device", "usb-hub,bus=xhci.0,port=1"]);
+    }
+    cmd.args(["-device", &format!("usb-kbd,bus=xhci.0{}", at(1))]);
+    cmd.args(["-device", &format!("usb-tablet,bus=xhci.0{}", at(2))]);
     cmd.arg("-drive").arg(format!(
         "if=none,id=stick,format=raw,file={}",
         o.image.display()
     ));
     cmd.args([
         "-device",
-        "usb-storage,bus=xhci.0,drive=stick,bootindex=0,removable=on",
+        &format!(
+            "usb-storage,bus=xhci.0,drive=stick,bootindex=0,removable=on{}",
+            at(3)
+        ),
     ]);
     if let Some(m) = &o.media {
         cmd.arg("-drive")
             .arg(format!("if=none,id=media,format=raw,file={}", m.display()));
-        cmd.args(["-device", "usb-storage,bus=xhci.0,drive=media,removable=on"]);
+        if !o.media_unplugged {
+            cmd.args([
+                "-device",
+                &format!("usb-storage,bus=xhci.0,drive=media,removable=on{}", at(4)),
+            ]);
+        }
     }
     // COM1: firmware console / debug log. COM2: ESC/POS printer capture.
     cmd.arg("-serial")
@@ -193,6 +217,18 @@ impl Qmp {
                 self.key(code, &[])?;
             }
             std::thread::sleep(delay);
+        }
+        Ok(())
+    }
+
+    /// Hot-plug the media stick (see [`QemuOpts::media_unplugged`]).
+    pub fn plug_media(&mut self, hub: bool) -> Res<()> {
+        let port = if hub { r#","port":"1.4""# } else { "" };
+        let r = self.cmd(&format!(
+            r#"{{"execute":"device_add","arguments":{{"driver":"usb-storage","bus":"xhci.0","drive":"media","id":"media0","removable":true{port}}}}}"#
+        ))?;
+        if r.contains("error") {
+            return Err(format!("device_add failed: {r}").into());
         }
         Ok(())
     }

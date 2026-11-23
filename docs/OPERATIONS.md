@@ -63,6 +63,10 @@ footer = Thank you!
 
 ## Export
 
+The export stick must be formatted **FAT32** (or FAT16). exFAT, the
+default for sticks over 32 GB on Windows, is not readable by either tier.
+Format it as FAT32 first.
+
 F10 → 7 writes `J<seq>.CSV` (journal: seq, chain hash, time, kind, receipt, user, amount, detail), `Z<n>.CSV` per Z report, and `CATALOG.CSV`. Exported records may then be recycled by the ring. Export at least after every Z; the status bar shows `EXPORT NEEDED` from 80 % journal usage, and at 100 % sales are refused until an export.
 
 ## After a power cut

@@ -28,6 +28,16 @@ Enroll on a till (pick whichever the firmware supports):
 
 Keep `*.key` offline (encrypted backup). Losing db.key means re-signing requires new keys and re-enrollment on every till; leaking it means anyone can sign images your tills will boot.
 
+### Tier B images
+
+Tier B uses the same keys. `cargo xtask sign --kernel` signs stage 0 and
+the config-enrolled `LIMINE.EFI` with `db.key` and writes
+`out/pos-kernel-signed.img`. Nothing else in the Tier B chain is a PE
+image: Limine checks `limine.conf` against the hash enrolled in its signed
+binary, and `limine.conf` pins the kernel's BLAKE2B hash. Changing any
+file on the ESP therefore breaks the chain (see `cargo xtask tamper-test`
+and `sb-test --kernel`).
+
 ## Writing the stick
 
 ```sh
@@ -57,6 +67,15 @@ Record results per hardware model; a model is approved only when all pass.
 - [ ] Entropy source reported (EFI RNG or RDSEED/RDRAND); no "no hardware entropy" warning.
 - [ ] 24-hour soak with a scripted keystroke generator: no slowdown, no watchdog reset.
 - [ ] RTC drift within ±2 s/day; set to UTC.
+
+Tier B additionally (run with `pos-kernel-signed.img`):
+
+- [ ] Every xHCI controller on the board starts; devices on each rear/front port enumerate. Note which ports sit behind internal hubs.
+- [ ] Touch panel's HID report descriptor is recognised (taps land where touched). If not, capture the descriptor for `pos_drivers::hid` tests.
+- [ ] Boot stick found on every port it may be plugged into (not behind a USB 3 hub).
+- [ ] Power-cut test (50×) repeated on Tier B with the production stick model; note whether the stick accepts SYNCHRONIZE CACHE (debug build logs it).
+- [ ] Same stick moved Tier A → Tier B → Tier A on one till stays trusted (shared NVRAM key).
+- [ ] 24-hour soak: clock does not drift against the RTC (TSC keeps running in idle).
 
 ## Known hardware/firmware risks
 
