@@ -171,6 +171,8 @@ impl Till {
             printer: &mut prn,
             rng: &mut self.rng,
             media: &mut self.media,
+            wifi: &mut pos_hal::NoWifi,
+            sound: &mut pos_hal::NoSound,
         };
         f(&mut self.app, &mut self.net, &mut hw)
     }
@@ -253,7 +255,7 @@ fn run(tills: &mut [&mut Till], clock: &Rc<Cell<i64>>, now_ms: &mut u64, ms: u64
 
 fn setup(t: &mut Till, name: &str, pin: &str) {
     t.typ(&format!("{name}\n{pin}\n{pin}\n"));
-    t.typ(&format!("1\n{pin}\n"));
+    t.typ("\n"); // signed in; keep the default store name
     assert!(
         matches!(t.app.screen(), Screen::Home),
         "{:?} {}",

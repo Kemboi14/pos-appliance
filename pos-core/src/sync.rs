@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::inventory::StockLevel;
 use crate::media::{Picture, PictureFor};
 use crate::money::Money;
+use crate::policy::Policy;
 
 pub type TillNo = u8;
 
@@ -107,6 +108,7 @@ pub enum SectionKey {
     Users,
     Config,
     Picture(PictureFor),
+    Policy,
 }
 
 /// State the head hands to lanes whole.
@@ -116,6 +118,7 @@ pub enum Section {
     Users(Vec<User>),
     Config(Config),
     Picture(PictureFor, Option<Picture>),
+    Policy(Policy),
 }
 
 impl Section {
@@ -125,6 +128,7 @@ impl Section {
             Section::Users(_) => SectionKey::Users,
             Section::Config(_) => SectionKey::Config,
             Section::Picture(k, _) => SectionKey::Picture(k.clone()),
+            Section::Policy(_) => SectionKey::Policy,
         }
     }
 }

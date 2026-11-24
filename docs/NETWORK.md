@@ -1,8 +1,8 @@
 # Store network (M9)
 
-Tills in one supermarket talk over the store's **wired Ethernet** LAN
-(switches; Wi-Fi access points may share the LAN for other devices, but the
-tills themselves are cabled — see "Why not Wi-Fi"). Every till keeps
+Tills in one supermarket talk over the store's **wired Ethernet** LAN, or
+— Tier A only, on PCs whose firmware has a Wi-Fi driver — over **Wi-Fi**
+(see "Wi-Fi"). Every till keeps
 working alone when the network or the head till is down and catches up
 when it returns: the network is never on the path of a sale.
 
@@ -65,10 +65,30 @@ payload a postcard-encoded `Message`.
 Tier A uses the firmware's Simple Network Protocol; Tier B has its own
 drivers (virtio-net for QEMU, Intel e1000e for common POS mainboards).
 
-## Why not Wi-Fi
+## Wi-Fi
 
-A Wi-Fi client needs a chipset driver, its firmware blob and a WPA2/WPA3
-supplicant — tens of thousands of lines per chip family, all of it
-attack surface reachable from the air. Cabled tills are also what payment
-and fiscal rules usually expect. A till that must be wireless can use a
-Wi-Fi-to-Ethernet bridge (it then appears to the till as a cable).
+**Tier A** tills can join a WPA2/WPA3-Personal network through the
+*firmware's own* Wi-Fi driver, using the UEFI protocols
+`EFI_WIRELESS_MAC_CONNECTION_II_PROTOCOL` (scan, join) and
+`EFI_SUPPLICANT_PROTOCOL` (network name and passphrase), the way EDK2's
+Wi-Fi Connection Manager does (`platform-uefi/src/wifi.rs`). Once joined,
+the Wi-Fi card's Simple Network Protocol carries ordinary Ethernet frames,
+so the store network above runs over it unchanged, with the same
+encryption.
+
+* Settings → **Wi-Fi**: scan, tap a network, type its password. The till
+  saves it (journal event `WIFI`; the CSV export shows only the network
+  name, never the password) and rejoins it at every start *before* it opens
+  a network card, and every 5 minutes while idle if the link drops.
+* Open (password-less) networks are refused.
+* Only some firmware has a Wi-Fi driver (typically business laptops and
+  mini-PCs that offer "HTTP boot over Wi-Fi"); elsewhere the page says *No
+  adapter*. **Untested in CI**: QEMU has no Wi-Fi device. Try it on the
+  real machine; the page's *Driver* line tells whether a supplicant was
+  found.
+* **Tier B** has no Wi-Fi: a chipset driver, its firmware blob and a
+  supplicant are tens of thousands of lines per chip family, all reachable
+  from the air. A Tier B till that must be wireless uses a
+  Wi-Fi-to-Ethernet bridge (it then looks like a cable).
+* Payment and fiscal rules often expect cabled tills; prefer a cable
+  where you can.

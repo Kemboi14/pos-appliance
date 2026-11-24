@@ -12,15 +12,18 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod admin;
 mod desktop;
 pub mod export;
 pub mod hasher;
 pub mod pictures;
 pub mod receipt;
+mod reports;
 mod screens;
 pub mod settings;
 pub mod stock;
 pub mod sync;
+mod wifi;
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -50,6 +53,8 @@ pub struct Hw<'a> {
     pub printer: &'a mut dyn Printer,
     pub rng: &'a mut dyn Rng,
     pub media: &'a mut dyn ExternalMedia,
+    pub wifi: &'a mut dyn pos_hal::Wifi,
+    pub sound: &'a mut dyn pos_hal::Sound,
 }
 
 impl core::fmt::Debug for Hw<'_> {
@@ -146,6 +151,9 @@ pub fn kind_code(e: &Event) -> u16 {
         Event::SyncRelayed { .. } => 29,
         Event::SyncResynced { .. } => 30,
         Event::SyncSection { .. } => 31,
+        Event::PolicySet { .. } => 32,
+        Event::UiSet { .. } => 33,
+        Event::WifiSet { .. } => 34,
     }
 }
 
@@ -158,12 +166,26 @@ pub enum Journaled {
 
 const RECENT: usize = 64;
 
+/// Sounds the app asks for; played (or not, per the till's settings)
+/// once the current event is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chirp {
+    /// A scan or code added an item.
+    Found,
+    /// Nothing matched.
+    Missing,
+    /// Key or tap feedback.
+    Click,
+}
+
 /// Which app the signed-in user is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
     Home,
     Till,
     Inventory,
+    Settings,
+    Reports,
 }
 
 pub struct App<D: BlockDevice> {
@@ -207,6 +229,12 @@ pub struct App<D: BlockDevice> {
     pub(crate) net_rt: sync::SyncRuntime,
     /// The signed-in user's record changed (from the head) during a sale.
     pub(crate) stale_user: bool,
+    /// Monotonic time of the last key or tap (automatic sign-out).
+    pub(crate) last_input_us: Option<u64>,
+    pub(crate) chirps: Vec<Chirp>,
+    /// The clock screen saver is showing (any key or tap wakes it).
+    pub(crate) saver: bool,
+    pub(crate) wifi_rt: wifi::WifiRuntime,
 }
 
 impl<D: BlockDevice> core::fmt::Debug for App<D> {
@@ -273,6 +301,10 @@ impl<D: BlockDevice> App<D> {
             gallery: pictures::Gallery::default(),
             net_rt: sync::SyncRuntime::default(),
             stale_user: false,
+            last_input_us: None,
+            chirps: Vec::new(),
+            saver: false,
+            wifi_rt: wifi::WifiRuntime::default(),
         };
         let status = match Store::open(dev, &key) {
             Ok(rec) => {
@@ -457,12 +489,55 @@ impl<D: BlockDevice> App<D> {
         self.set_msg(s, true);
     }
 
+    pub(crate) fn chirp(&mut self, c: Chirp) {
+        self.chirps.push(c);
+    }
+
+    fn play(&mut self, hw: &mut Hw<'_>) {
+        let p = &self.state.ui;
+        for c in core::mem::take(&mut self.chirps) {
+            match c {
+                Chirp::Found if p.beep_on_scan => hw.sound.beep(1800, 45),
+                Chirp::Missing if p.beep_on_scan => hw.sound.beep(320, 160),
+                Chirp::Click if p.key_click => hw.sound.beep(2600, 4),
+                _ => {}
+            }
+        }
+    }
+
     /// Feed one input event. Returns what the platform should do next.
     pub fn handle(&mut self, ev: InputEvent, hw: &mut Hw<'_>) -> Control {
         self.dirty = true;
+        // The screen saver swallows the input that wakes it.
+        if self.saver {
+            let wake = match ev {
+                InputEvent::Key { at_us, .. } => Some(at_us),
+                InputEvent::Pointer {
+                    pressed: false,
+                    at_us,
+                    ..
+                } => Some(at_us),
+                InputEvent::Pointer { .. } => None,
+            };
+            if let Some(at) = wake {
+                self.saver = false;
+                self.last_input_us = Some(at);
+                self.press_from = None;
+                self.press_now = None;
+                self.canvas.invalidate();
+            }
+            return Control::Continue;
+        }
+        match ev {
+            InputEvent::Key { .. } | InputEvent::Pointer { pressed: false, .. } => {
+                self.chirp(Chirp::Click);
+            }
+            _ => {}
+        }
         match ev {
             InputEvent::Key { key, mods, at_us } => {
                 self.now_us = at_us;
+                self.last_input_us = Some(at_us);
                 screens::on_key(self, key, mods, at_us, hw);
             }
             InputEvent::Pointer {
@@ -472,6 +547,7 @@ impl<D: BlockDevice> App<D> {
                 at_us,
             } => {
                 self.now_us = at_us;
+                self.last_input_us = Some(at_us);
                 let p = (x as i32, y as i32);
                 // A tap is a press and a release; the widget acts only if
                 // both land on it. While held, the widget under the finger
@@ -496,6 +572,7 @@ impl<D: BlockDevice> App<D> {
             self.place = Place::Home;
             self.screen = screens::login_screen(self);
         }
+        self.play(hw);
         if self.fatal {
             Control::Reset
         } else {
@@ -515,10 +592,78 @@ impl<D: BlockDevice> App<D> {
                 && (y - p.1).abs() <= near)
     }
 
-    /// Periodic tick (clock in the status bar).
-    pub fn tick(&mut self, _hw: &mut Hw<'_>) {
+    /// Periodic tick (clock in the status bar, automatic sign-out).
+    pub fn tick(&mut self, hw: &mut Hw<'_>) {
         self.dirty = true;
         self.canvas.warm(48);
+        self.idle_signout(hw);
+        self.screen_saver(hw);
+        wifi::tick(self, hw);
+    }
+
+    /// Start the clock screen saver after the idle time, unless a sale or
+    /// payment is open.
+    fn screen_saver(&mut self, hw: &mut Hw<'_>) {
+        let mins = self.state.ui.saver_mins;
+        if mins == 0 || self.saver || !self.cart.is_empty() || self.payment.is_some() {
+            return;
+        }
+        let now = hw.clock.monotonic_us();
+        let last = *self.last_input_us.get_or_insert(now);
+        if now.saturating_sub(last) >= u64::from(mins) * 60_000_000 {
+            self.saver = true;
+        }
+    }
+
+    /// Is the screen saver showing? (tests)
+    pub fn saver_on(&self) -> bool {
+        self.saver
+    }
+
+    /// Sign out after the store's idle limit, never with a sale open.
+    fn idle_signout(&mut self, hw: &mut Hw<'_>) {
+        let mins = self.state.policy.idle_signout_mins;
+        if mins == 0 || self.user.is_none() || !self.cart.is_empty() || self.payment.is_some() {
+            return;
+        }
+        if matches!(self.screen, Screen::Pay) {
+            return;
+        }
+        let now = hw.clock.monotonic_us();
+        let last = self.last_input_us.get_or_insert(now);
+        if now.saturating_sub(*last) >= u64::from(mins) * 60_000_000 {
+            self.last_input_us = None;
+            self.screen = screens::sign_out(self, hw);
+            self.set_msg(
+                format!(
+                    "Signed out after {mins} minute{} without use",
+                    if mins == 1 { "" } else { "s" }
+                ),
+                false,
+            );
+        }
+    }
+
+    /// May the signed-in user open this app?
+    pub(crate) fn can_use(&self, place: Place) -> bool {
+        use pos_core::auth::Permission as P;
+        let Some(u) = self.user else { return false };
+        let may = |p| self.state.allows(u, p);
+        match place {
+            // Everyone may look stock up; changing it needs `Stock`.
+            Place::Home | Place::Settings | Place::Inventory => true,
+            Place::Till => may(P::Sell),
+            Place::Reports => may(P::XReport),
+        }
+    }
+
+    /// Wall-clock time without a clock (pages drawn between events).
+    pub(crate) fn now_unix(&self) -> i64 {
+        self.state.last_event_at
+    }
+
+    pub(crate) fn store_usage(&self) -> (u64, u64) {
+        self.store.as_ref().map(|s| s.usage()).unwrap_or((0, 1))
     }
 
     /// Redraw if needed and present to the display.

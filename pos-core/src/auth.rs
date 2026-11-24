@@ -12,6 +12,29 @@ pub type UserId = u16;
 pub enum Role {
     Cashier,
     Manager,
+    /// Shift lead: voids, refunds, discounts and overrides for cashiers.
+    Supervisor,
+    /// Back room: deliveries, counts and write-offs; no selling.
+    StockClerk,
+}
+
+impl Role {
+    /// Every role, most senior first (pickers and settings lists).
+    pub const ALL: [Role; 4] = [
+        Role::Manager,
+        Role::Supervisor,
+        Role::Cashier,
+        Role::StockClerk,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Manager => "Manager",
+            Role::Supervisor => "Supervisor",
+            Role::Cashier => "Cashier",
+            Role::StockClerk => "Stock clerk",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -38,6 +61,38 @@ pub enum Permission {
 }
 
 impl Permission {
+    pub const ALL: [Permission; 18] = [
+        Permission::Sell,
+        Permission::OpenShift,
+        Permission::Reprint,
+        Permission::XReport,
+        Permission::ZReport,
+        Permission::LineVoid,
+        Permission::VoidSale,
+        Permission::Refund,
+        Permission::PriceOverride,
+        Permission::Discount,
+        Permission::NoSale,
+        Permission::Stock,
+        Permission::ManageCatalog,
+        Permission::Export,
+        Permission::Import,
+        Permission::UnlockUser,
+        Permission::ManageUsers,
+        Permission::Configure,
+    ];
+
+    /// Bit in a role's permission mask.
+    pub fn bit(self) -> u32 {
+        1 << (self as u32)
+    }
+
+    /// Kept for managers only, whatever the role settings say, so nobody
+    /// can grant themselves more rights or lock the managers out.
+    pub fn manager_only(self) -> bool {
+        matches!(self, Permission::ManageUsers | Permission::Configure)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Permission::Sell => "sell",
@@ -62,15 +117,19 @@ impl Permission {
     }
 }
 
-/// Static role → permission matrix. Anything a cashier lacks needs a manager
-/// override (manager PIN), which is logged as an audit event.
+/// Default role → permission matrix (managers can change it per store in
+/// Settings > Roles, see [`crate::policy::Policy`]). Anything a user lacks
+/// needs an override by someone who has it, logged as an audit event.
 pub fn role_allows(role: Role, p: Permission) -> bool {
+    use Permission as P;
     match role {
         Role::Manager => true,
-        Role::Cashier => matches!(
+        Role::Cashier => matches!(p, P::Sell | P::Reprint | P::XReport | P::OpenShift),
+        Role::Supervisor => !matches!(
             p,
-            Permission::Sell | Permission::Reprint | Permission::XReport | Permission::OpenShift
+            P::ManageUsers | P::Configure | P::Import | P::ManageCatalog
         ),
+        Role::StockClerk => matches!(p, P::Stock | P::ManageCatalog | P::Export | P::Reprint),
     }
 }
 

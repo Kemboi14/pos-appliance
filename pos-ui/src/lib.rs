@@ -164,6 +164,8 @@ pub struct Canvas {
     px: Vec<Rgb888>,
     dirty: Option<Rect>,
     zoom: i32,
+    /// Text size against the layout, in thousandths (user setting).
+    text_scale: i32,
     fonts: Fonts,
     /// Progress through [`WARM`] (glyphs rasterised ahead of use).
     warm_pos: usize,
@@ -186,6 +188,7 @@ impl Canvas {
             px: vec![0; (w * h) as usize],
             dirty: Some(Rect::new(0, 0, w as i32, h as i32)),
             zoom,
+            text_scale: 1000,
             fonts: Fonts::new(),
             warm_pos: 0,
         }
@@ -202,6 +205,18 @@ impl Canvas {
     /// Scale against the 1024×768 design, in thousandths.
     pub fn zoom(&self) -> i32 {
         self.zoom
+    }
+    /// Text size in thousandths of the design size (1000 = normal).
+    /// Layout spacing is unchanged; labels fit or shorten themselves.
+    pub fn set_text_scale(&mut self, permille: i32) {
+        let s = permille.clamp(800, 1600);
+        if s != self.text_scale {
+            self.text_scale = s;
+            self.invalidate();
+        }
+    }
+    pub fn text_scale(&self) -> i32 {
+        self.text_scale
     }
     /// A baseline length (pixels at 1024×768) at this canvas's zoom.
     pub fn px(&self, base: i32) -> i32 {
@@ -285,7 +300,7 @@ impl Canvas {
     fn face(&self, font: Font) -> Face {
         Face {
             bold: font.bold(),
-            px: self.px(font.base_px()).clamp(6, 400) as u16,
+            px: (self.px(font.base_px()) * self.text_scale / 1000).clamp(6, 400) as u16,
         }
     }
 
@@ -517,7 +532,10 @@ pub struct Theme {
     pub muted: Rgb888,
     pub accent: Rgb888,
     pub button: Rgb888,
+    /// Text on [`Theme::button`].
     pub button_text: Rgb888,
+    /// Text on accent, danger and ok fills.
+    pub on_accent: Rgb888,
     pub danger: Rgb888,
     pub ok: Rgb888,
     pub warn: Rgb888,
@@ -532,11 +550,41 @@ pub const THEME: Theme = Theme {
     accent: 0x002F_81F7,
     button: 0x0033_3D4B,
     button_text: 0x00FF_FFFF,
+    on_accent: 0x00FF_FFFF,
     danger: 0x00D7_3A49,
     ok: 0x0028_A745,
     warn: 0x00E3_B341,
     select: 0x0035_5C9A,
 };
+
+/// Light theme for bright shops and sunlit counters.
+pub const LIGHT: Theme = Theme {
+    bg: 0x00EE_F1F5,
+    panel: 0x00FF_FFFF,
+    text: 0x0017_1C24,
+    muted: 0x005A_6472,
+    accent: 0x0025_63EB,
+    button: 0x00DD_E3EA,
+    button_text: 0x0017_1C24,
+    on_accent: 0x00FF_FFFF,
+    danger: 0x00C5_2233,
+    ok: 0x0015_803D,
+    warn: 0x00B4_5309,
+    select: 0x00BF_D7FE,
+};
+
+impl Theme {
+    /// This theme with another accent colour (selection follows it).
+    pub fn with_accent(mut self, accent: Rgb888, light: bool) -> Theme {
+        self.accent = accent;
+        self.select = if light {
+            mix(accent, 0x00FF_FFFF, 190)
+        } else {
+            mix(accent, self.bg, 120)
+        };
+        self
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonStyle {
@@ -652,9 +700,9 @@ impl<'a> Ui<'a> {
     pub fn button_font(&mut self, r: Rect, label: &str, style: ButtonStyle, font: Font) -> bool {
         let (bg, fg) = match style {
             ButtonStyle::Normal => (self.theme.button, self.theme.button_text),
-            ButtonStyle::Primary => (self.theme.accent, self.theme.button_text),
-            ButtonStyle::Danger => (self.theme.danger, self.theme.button_text),
-            ButtonStyle::Ok => (self.theme.ok, self.theme.button_text),
+            ButtonStyle::Primary => (self.theme.accent, self.theme.on_accent),
+            ButtonStyle::Danger => (self.theme.danger, self.theme.on_accent),
+            ButtonStyle::Ok => (self.theme.ok, self.theme.on_accent),
             ButtonStyle::Disabled => (self.theme.panel, self.theme.muted),
         };
         let live = style != ButtonStyle::Disabled;

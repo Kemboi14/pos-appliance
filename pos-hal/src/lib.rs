@@ -35,6 +35,8 @@ pub enum HalError {
     EntropyFailure,
     /// The file or object does not exist.
     NotFound,
+    /// The other side refused (e.g. a Wi-Fi network rejected the password).
+    Refused,
 }
 
 impl fmt::Display for HalError {
@@ -49,6 +51,7 @@ impl fmt::Display for HalError {
             HalError::MediaChanged => "media changed",
             HalError::EntropyFailure => "entropy source failure",
             HalError::NotFound => "not found",
+            HalError::Refused => "refused",
         };
         f.write_str(s)
     }
@@ -406,4 +409,73 @@ mod tests {
         };
         assert_eq!(bad.to_unix(), None);
     }
+}
+
+// ---------------------------------------------------------------- wi-fi
+
+/// A network found by a Wi-Fi scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiNetwork {
+    pub ssid: String,
+    /// Signal quality 0-100.
+    pub quality: u8,
+    /// Needs a password (WPA2/WPA3-Personal). Open networks are listed
+    /// but the till refuses them.
+    pub secured: bool,
+}
+
+/// Wi-Fi through the firmware's driver (Tier A) — or nothing.
+///
+/// Calls block for at most their timeout (a scan takes a few seconds).
+pub trait Wifi {
+    /// Is there a Wi-Fi adapter with a usable firmware driver?
+    fn present(&self) -> bool;
+    /// Human-readable description for diagnostics (driver, supplicant).
+    fn describe(&self) -> String;
+    fn scan(&mut self) -> HalResult<Vec<WifiNetwork>>;
+    /// Join a WPA2/WPA3-Personal network.
+    fn connect(&mut self, ssid: &str, password: &str) -> HalResult<()>;
+    fn disconnect(&mut self) -> HalResult<()>;
+    /// The network joined, if any.
+    fn connected(&self) -> Option<String>;
+}
+
+/// No Wi-Fi (Tier B, tests, firmware without a Wi-Fi driver).
+#[derive(Debug, Default)]
+pub struct NoWifi;
+
+impl Wifi for NoWifi {
+    fn present(&self) -> bool {
+        false
+    }
+    fn describe(&self) -> String {
+        String::from("no Wi-Fi adapter with a firmware driver")
+    }
+    fn scan(&mut self) -> HalResult<Vec<WifiNetwork>> {
+        Err(HalError::NotPresent)
+    }
+    fn connect(&mut self, _: &str, _: &str) -> HalResult<()> {
+        Err(HalError::NotPresent)
+    }
+    fn disconnect(&mut self) -> HalResult<()> {
+        Err(HalError::NotPresent)
+    }
+    fn connected(&self) -> Option<String> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------- sound
+
+/// A simple tone generator (the PC speaker), or nothing.
+pub trait Sound {
+    /// Sound `hz` for about `ms` milliseconds (short: may block).
+    fn beep(&mut self, hz: u32, ms: u32);
+}
+
+#[derive(Debug, Default)]
+pub struct NoSound;
+
+impl Sound for NoSound {
+    fn beep(&mut self, _: u32, _: u32) {}
 }

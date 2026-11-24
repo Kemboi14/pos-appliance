@@ -16,13 +16,15 @@ use crate::config::Config;
 use crate::inventory::{Adjust, Inventory, Received};
 use crate::media::{Picture, PictureFor, Pictures};
 use crate::money::{Money, MoneyError, Qty};
+use crate::policy::Policy;
 use crate::sale::{Refund, RefundLine, Refundable, RefundableLine, Sale, SoldLine};
-use crate::shift::{Counters, Report, ReportKind, Shift};
+use crate::shift::{Counters, Report, ReportKind, Shift, ShiftStats};
 use crate::sync::{
     Levels, Movement, NetRole, NetSettings, SaleNote, Section, SectionKey, StockMove, SyncState,
     TillNo,
 };
 use crate::tender::{Payment, Tender, TenderKind};
+use crate::ui::{UiPrefs, WifiSettings};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -197,6 +199,24 @@ pub enum Event {
         version: u64,
         section: Section,
     },
+    /// Role permissions, sales goal, idle sign-out (Settings).
+    PolicySet {
+        by: UserId,
+        at: i64,
+        policy: Policy,
+    },
+    /// This till's look and sound (Settings > Display & sound).
+    UiSet {
+        by: UserId,
+        at: i64,
+        prefs: UiPrefs,
+    },
+    /// This till's Wi-Fi network; `None` forgets it.
+    WifiSet {
+        by: UserId,
+        at: i64,
+        wifi: Option<WifiSettings>,
+    },
 }
 
 impl Event {
@@ -229,7 +249,10 @@ impl Event {
             | Event::SyncAcked { at, .. }
             | Event::SyncRelayed { at, .. }
             | Event::SyncResynced { at, .. }
-            | Event::SyncSection { at, .. } => *at,
+            | Event::SyncSection { at, .. }
+            | Event::PolicySet { at, .. }
+            | Event::UiSet { at, .. }
+            | Event::WifiSet { at, .. } => *at,
             Event::SaleCompleted(s) => s.at,
             Event::RefundCompleted(r) => r.at,
             Event::Report(r) => r.at,
@@ -271,6 +294,9 @@ impl Event {
             Event::SyncRelayed { .. } => "SYNC_RELAY",
             Event::SyncResynced { .. } => "SYNC_RESYNC",
             Event::SyncSection { .. } => "SYNC_SECTION",
+            Event::PolicySet { .. } => "POLICY",
+            Event::UiSet { .. } => "UI",
+            Event::WifiSet { .. } => "WIFI",
         }
     }
 }
@@ -355,6 +381,31 @@ pub struct PosState {
     pub pictures: Pictures,
     pub net: NetSettings,
     pub sync: SyncState,
+    pub policy: Policy,
+    pub stats: ShiftStats,
+    pub ui: UiPrefs,
+    pub wifi: Option<WifiSettings>,
+}
+
+/// Snapshot layout of M9 (before role policy and shift statistics).
+#[derive(Deserialize)]
+struct PosStateV3 {
+    config: Config,
+    catalog: Catalog,
+    users: BTreeMap<UserId, User>,
+    locks: BTreeMap<UserId, LockState>,
+    shift: Option<Shift>,
+    next_receipt: u64,
+    next_z: u32,
+    next_shift: u32,
+    grand_total: Money,
+    refundable: BTreeMap<u64, Refundable>,
+    events: u64,
+    last_event_at: i64,
+    inventory: Inventory,
+    pictures: Pictures,
+    net: NetSettings,
+    sync: SyncState,
 }
 
 /// Snapshot layout of M8 (before the store network).
@@ -399,6 +450,30 @@ impl PosState {
         if let Ok(s) = postcard::from_bytes::<PosState>(b) {
             return Some(s);
         }
+        if let Ok(v) = postcard::from_bytes::<PosStateV3>(b) {
+            return Some(PosState {
+                config: v.config,
+                catalog: v.catalog,
+                users: v.users,
+                locks: v.locks,
+                shift: v.shift,
+                next_receipt: v.next_receipt,
+                next_z: v.next_z,
+                next_shift: v.next_shift,
+                grand_total: v.grand_total,
+                refundable: v.refundable,
+                events: v.events,
+                last_event_at: v.last_event_at,
+                inventory: v.inventory,
+                pictures: v.pictures,
+                net: v.net,
+                sync: v.sync,
+                policy: Policy::default(),
+                stats: ShiftStats::default(),
+                ui: UiPrefs::default(),
+                wifi: None,
+            });
+        }
         if let Ok(v) = postcard::from_bytes::<PosStateV2>(b) {
             return Some(PosState {
                 config: v.config,
@@ -417,6 +492,10 @@ impl PosState {
                 pictures: v.pictures,
                 net: NetSettings::default(),
                 sync: SyncState::default(),
+                policy: Policy::default(),
+                stats: ShiftStats::default(),
+                ui: UiPrefs::default(),
+                wifi: None,
             });
         }
         let v: PosStateV1 = postcard::from_bytes(b).ok()?;
@@ -437,6 +516,10 @@ impl PosState {
             pictures: Pictures::default(),
             net: NetSettings::default(),
             sync: SyncState::default(),
+            policy: Policy::default(),
+            stats: ShiftStats::default(),
+            ui: UiPrefs::default(),
+            wifi: None,
         })
     }
 }
@@ -460,6 +543,10 @@ impl Default for PosState {
             pictures: Pictures::default(),
             net: NetSettings::default(),
             sync: SyncState::default(),
+            policy: Policy::default(),
+            stats: ShiftStats::default(),
+            ui: UiPrefs::default(),
+            wifi: None,
         }
     }
 }
@@ -481,7 +568,7 @@ impl PosState {
         if !u.active {
             return Err(DomainError::UserInactive);
         }
-        if !auth::role_allows(u.role, p) {
+        if !self.policy.allows(u.role, p) {
             return Err(DomainError::Forbidden(p));
         }
         Ok(())
@@ -716,6 +803,7 @@ impl PosState {
             | Event::CatalogReplace { .. }
             | Event::ConfigSet { .. }
             | Event::PictureSet { .. }
+            | Event::PolicySet { .. }
             | Event::UserSet { by: Some(_), .. } => Err(DomainError::ManagedByHead),
             _ => Ok(()),
         }
@@ -732,6 +820,7 @@ impl PosState {
                 | Event::CatalogReplace { .. } => Some(SectionKey::Catalog),
                 Event::UserSet { .. } => Some(SectionKey::Users),
                 Event::ConfigSet { .. } => Some(SectionKey::Config),
+                Event::PolicySet { .. } => Some(SectionKey::Policy),
                 Event::PictureSet { target, .. } => Some(SectionKey::Picture(target.clone())),
                 _ => None,
             };
@@ -825,6 +914,7 @@ impl PosState {
         s.insert(SectionKey::Config, v);
         s.insert(SectionKey::Users, v);
         s.insert(SectionKey::Catalog, v);
+        s.insert(SectionKey::Policy, v);
         for k in self.pictures.keys() {
             s.insert(SectionKey::Picture(k.clone()), v);
         }
@@ -835,6 +925,10 @@ impl PosState {
             Section::Config(c) => {
                 c.validate().map_err(DomainError::Config)?;
                 self.config = c.clone();
+            }
+            Section::Policy(p) => {
+                p.validate().map_err(DomainError::Config)?;
+                self.policy = p.clone();
             }
             Section::Users(users) => {
                 if !users.iter().any(|u| u.role == Role::Manager && u.active) {
@@ -889,6 +983,23 @@ impl PosState {
                 }
                 self.config = config.clone();
             }
+            Event::UiSet { by, prefs, .. } => {
+                self.require(*by, Permission::Configure)?;
+                prefs.validate().map_err(DomainError::Config)?;
+                self.ui = prefs.clone();
+            }
+            Event::WifiSet { by, wifi, .. } => {
+                self.require(*by, Permission::Configure)?;
+                if let Some(w) = wifi {
+                    w.validate().map_err(DomainError::Config)?;
+                }
+                self.wifi = wifi.clone();
+            }
+            Event::PolicySet { by, policy, .. } => {
+                self.require(*by, Permission::Configure)?;
+                policy.validate().map_err(DomainError::Config)?;
+                self.policy = policy.clone();
+            }
             Event::UserSet { by, user, .. } => {
                 match by {
                     None => {
@@ -896,6 +1007,16 @@ impl PosState {
                             return Err(DomainError::SetupDone);
                         }
                     }
+                    // Anyone may change their own PIN, and nothing else.
+                    Some(b)
+                        if *b == user.id
+                            && self.users.get(b).is_some_and(|me| {
+                                me.active
+                                    && User {
+                                        pin: user.pin.clone(),
+                                        ..me.clone()
+                                    } == *user
+                            }) => {}
                     Some(b) => self.require(*b, Permission::ManageUsers)?,
                 }
                 if user.name.trim().is_empty() || user.name.chars().count() > 24 {
@@ -990,9 +1111,16 @@ impl PosState {
                     float: *float,
                     counters: Counters::default(),
                 });
+                self.stats = ShiftStats::new(*shift_id);
             }
-            Event::SaleCompleted(s) => self.apply_sale(s)?,
-            Event::RefundCompleted(r) => self.apply_refund(r)?,
+            Event::SaleCompleted(s) => {
+                self.apply_sale(s)?;
+                self.stats.add_sale(s);
+            }
+            Event::RefundCompleted(r) => {
+                self.apply_refund(r)?;
+                self.stats.add_refund(r);
+            }
             Event::LineVoided {
                 by, authorized_by, ..
             } => {

@@ -4,19 +4,67 @@
 
 There are **no default passwords or PINs**. On first boot the till asks
 for the manager's name and a 4–8 digit PIN; that manager is user number 1.
-Managers add cashiers (and further managers) with their own PINs from the
-manager menu. PINs are stored only as Argon2id hashes; a forgotten PIN
-cannot be read back — another manager resets it by unlocking or re-adding
-the user. Five wrong PINs lock a user (managers: a timed lockout).
+Managers add users with their own PINs in **Settings → Users** (or menu →
+"Add user"). PINs are stored only as Argon2id hashes; a forgotten PIN
+cannot be read back — a manager sets a new one (Settings → Users → the
+user → PIN). Anyone can change their own PIN (Settings → My PIN). Five
+wrong PINs lock a user (managers: a timed lockout).
 
 ## First boot
 
-1. "First-time setup": manager name, PIN (4–8 digits) twice. The store is bound to this machine.
-2. The sign-in screen shows the clock and a tile per user: tap your name (or type your user number), then your PIN.
-3. The home screen shows the two apps, **Till** and **Inventory**, plus the manager menu and sign out. Keys: `1`/Enter Till, `2` Inventory, F10 menu, F12 sign out.
-4. Manager menu (F10) → 9 "Import settings" (`SETTINGS.TXT`) and 8 "Import catalog" (`CATALOG.CSV`) from a FAT USB stick, then "Import pictures".
-5. F10 → "Add cashier".
-6. Open **Till**: enter the opening float. The **Home** button (top left, or the Home key) goes back to the home screen when no sale is open.
+1. "First-time setup": manager name, PIN (4–8 digits) twice. The store is bound to this machine and the manager is **signed in straight away**.
+2. "Name your store" (optional; Enter keeps it for later).
+3. Later sign-ins: the sign-in screen shows the clock and a tile per user. Tap your name, or type your **name** (any case, first name or its start) or your **user number**, then your PIN.
+4. The home screen shows the apps your role may use (**Till**, **Inventory**, **Reports**, **Settings**), plus the menu and sign out. Keys: `1`/Enter Till, `2` Inventory, `3` Settings, `4` Reports, F10 menu, F12 sign out.
+5. Menu (F10) → 9 "Import settings" (`SETTINGS.TXT`) and 8 "Import catalog" (`CATALOG.CSV`) from a FAT USB stick, then "Import pictures".
+6. Settings → Users → "+ Add user": name, role, PIN twice.
+7. Open **Till**: enter the opening float. The **Home** button (top left, or the Home key) goes back to the home screen when no sale is open.
+
+## Roles and Settings
+
+| Role | By default may |
+|---|---|
+| Manager | everything (fixed) |
+| Supervisor | everything except users, configuration, catalog and imports: voids, refunds, discounts, price overrides, no sale, Z report, stock, unlock users, export — and authorise these for cashiers |
+| Cashier | sell, open a shift, reprint, X report |
+| Stock clerk | stock changes, catalog pictures, export, reprint (no Till app) |
+
+Anything a user's role lacks gets the override prompt: someone whose role
+has it enters their PIN (journaled as `OVERRIDE`).
+
+**Settings** (home screen, or menu → "Settings"):
+
+* **My PIN** — anyone.
+* **Users** — role (tap to cycle), name, PIN reset, disable/enable, unlock. Needs *users* (managers).
+* **Roles & permissions** — per role, tap a permission to allow it or require an override; "Restore the default permissions". *Users* and *configure* stay manager-only so nobody can grant themselves more. Needs *configure*.
+* **Shift sales goal** — the home screen shows a progress bar (and a little celebration when it is reached; the till announces it on the sale that crosses it). 0 = off.
+* **Automatic sign-out** — after N idle minutes (never during a sale). 0 = never.
+* **Store name**, **Import settings**, **Store network**, **Network status**, **About this till**.
+
+**Reports** (needs *X report*): the shift at a glance — sales, receipts,
+average sale, refunds; sales by hour (tap a bar, or ←/→, for that hour's
+figures); best sellers; cashiers; takings per payment type (cash net of
+change). F1 prints an X report. The figures survive a reboot and reset when
+a shift opens.
+
+**Paying:** above the keypad are quick-cash buttons — *Exact*, then the next
+round amounts (e.g. 2.40 due → 5, 10, 20). One tap records the cash and
+shows the change.
+
+**Menu** (F10): grouped into *Sales & receipts*, *USB stick* and *Team &
+store*. Digits 1–9, 0 still pick the numbered items; items your role can't
+do alone say "needs approval".
+
+**Display & sound** (Settings; this till only, needs *configure*):
+dark or light theme; accent colour; text size (normal, large, extra
+large); a left-handed sale screen (keys on the left); pictures on quick
+keys; a beep on every scan (a low tone when nothing matched); a key click;
+a clock screen saver after N idle minutes (not during a sale; any key or
+tap wakes it without doing anything else). Sound uses the PC speaker,
+which many modern PCs don't have — "Test the speaker" tells you.
+
+Role permissions, the goal and the sign-out time are one `POLICY` journal
+event; on a store network the head hands them to the lanes like users.
 
 ## Sale screen keys
 
@@ -64,7 +112,7 @@ Open **Inventory** from the home screen. The top cards show products, low and ou
   * **Write off** (F3): quantity and reason (damaged, expired, theft/loss, returned to supplier, other).
   * **Reorder level** (F4): flag the product as low at this quantity (0 = never).
 * A product is *tracked* from its first delivery or count. Sales take tracked stock off automatically and refunds put it back; untracked products (services, bags) are sold without stock. Stock may go negative — the till never refuses a sale over it; count the product.
-* Stock changes need the **stock** permission (managers). A cashier gets the manager-override prompt.
+* Stock changes need the **stock** permission (managers, supervisors, stock clerks by default). Others get the override prompt.
 * Every stock change is a journal event like a sale (in the hash chain, exported in the journal CSV).
 
 `STOCK.CSV`: `sku,name,status,on_hand,reorder_at,last_cost,retail_value`.
@@ -84,7 +132,7 @@ Characters a file name cannot hold (`/ \ : * ? " < > |`) are written `_` in `IMG
 
 ## Store network (several tills)
 
-Tills are connected by **network cable** to the store's switch (see `docs/NETWORK.md` for why not Wi-Fi). One till is the **head**; the others are **lanes**.
+Tills are connected by **network cable** to the store's switch, or on Tier A by **Wi-Fi** where the PC's firmware has a Wi-Fi driver (Settings → Wi-Fi; see `docs/NETWORK.md`). Join Wi-Fi first, then set up the store network. One till is the **head**; the others are **lanes**.
 
 1. On the head: manager menu → "Network setup" → `2` Head → till number (e.g. 1) → IP address (empty = DHCP, or `192.168.1.10/24 gw 192.168.1.1`). The screen shows the **store network code**; with a USB stick inserted it is also written to `STORENET.KEY`. Keep it safe: it is the store's network password.
 2. On each lane: "Network setup" → `3` Lane → its own till number → type the code (or leave empty to read `STORENET.KEY` from the stick) → IP address → head's address (empty = find automatically).

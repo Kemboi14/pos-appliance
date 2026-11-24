@@ -32,6 +32,16 @@ pub(crate) struct DeskView {
     pub stock_sub: String,
     pub stock_alert: bool,
     pub net: String,
+    /// Apps this user's role may open: (till, inventory).
+    pub can_till: bool,
+    pub can_stock: bool,
+    pub can_reports: bool,
+    pub reports_sub: String,
+    pub settings_sub: String,
+    /// Shift goal: caption and percent reached (None when off).
+    pub goal: Option<(String, u32)>,
+    /// One line of shift figures under the greeting.
+    pub today: String,
 }
 
 fn glass(ui: &mut Ui<'_>, r: Rect, alpha: u8) {
@@ -215,7 +225,7 @@ pub(crate) fn draw_lock(
                 }
                 let hint_y = grid.y + grid.h + u;
                 let hint = if p.field.is_empty() {
-                    String::from("Tap your name, or type your user number and press Enter")
+                    String::from("Tap your name, or type your name or number and press Enter")
                 } else {
                     format!("User number: {}_", p.field)
                 };
@@ -298,6 +308,80 @@ fn app_card(ui: &mut Ui<'_>, r: Rect, name: &str, sub: &str, icon: Icon, alert: 
 enum Icon {
     Till,
     Stock,
+    Settings,
+    Reports,
+}
+
+/// Unit vectors (×100) for 8 compass directions, for the gear and confetti.
+const DIRS: [(i32, i32); 8] = [
+    (100, 0),
+    (71, 71),
+    (0, 100),
+    (-71, 71),
+    (-100, 0),
+    (-71, -71),
+    (0, -100),
+    (71, -71),
+];
+
+/// A glass bar with a coloured fill for the shift goal; confetti at 100 %.
+fn goal_bar(ui: &mut Ui<'_>, r: Rect, caption: &str, pct: u32) {
+    let u = ui.u();
+    glass(ui, r, 150);
+    let track = r.inset(u / 2);
+    let fill_w = track.w * pct.min(100) as i32 / 100;
+    let rad = track.h / 2;
+    let done = pct >= 100;
+    if fill_w > 0 {
+        let (top, bot) = if done {
+            (0x00FB_BF24, 0x00F5_9E0B)
+        } else {
+            (0x0034_D399, 0x0005_9669)
+        };
+        ui.c.fill_gradient(
+            Rect::new(track.x, track.y, fill_w.max(2 * rad), track.h),
+            rad,
+            top,
+            bot,
+        );
+    }
+    if done {
+        confetti(ui, r);
+    }
+    ui.label_color(r, caption, Font::Bold, 1, WHITE);
+}
+
+/// Deterministic sprinkles around a rectangle (a small celebration).
+fn confetti(ui: &mut Ui<'_>, r: Rect) {
+    const COLORS: [Rgb888; 6] = [
+        0x00F4_3F5E,
+        0x00FB_BF24,
+        0x0034_D399,
+        0x0060_A5FA,
+        0x00C0_84FC,
+        0x00FF_FFFF,
+    ];
+    let u = ui.u();
+    let mut seed: u32 = 0x9E37_79B9;
+    for k in 0..36 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        // Above the bar only, so the line below stays readable.
+        let x = r.x + (seed % r.w.max(1) as u32) as i32;
+        let dy = ((seed >> 8) % (3 * u.max(1) as u32)) as i32;
+        let y = r.y - u - dy;
+        let c = COLORS[(seed >> 4) as usize % COLORS.len()];
+        let sz = u / 2 + ((seed >> 12) % 3) as i32 * u / 4;
+        if k % 3 == 0 {
+            ui.c.fill_circle(x, y, sz.max(1), c);
+        } else {
+            let (dx, dy) = DIRS[(seed >> 16) as usize % 8];
+            let w = (sz * 2 + dx.abs() * sz / 100).max(2);
+            let h = (sz + dy.abs() * sz / 100).max(2);
+            ui.c.fill_round_rect(Rect::new(x, y, w, h), 1, c);
+        }
+    }
 }
 
 /// App icons drawn from shapes: a rounded gradient square with a
@@ -307,6 +391,8 @@ fn draw_icon(ui: &mut Ui<'_>, r: Rect, icon: Icon) {
     let (top, bot) = match icon {
         Icon::Till => (0x0034_D399, 0x0005_7A55),
         Icon::Stock => (0x00FB_BF24, 0x00EA_580C),
+        Icon::Settings => (0x0094_A3B8, 0x0033_4155),
+        Icon::Reports => (0x0060_A5FA, 0x0025_63EB),
     };
     ui.c.fill_gradient(r, rad, top, bot);
     let s = r.w;
@@ -337,6 +423,28 @@ fn draw_icon(ui: &mut Ui<'_>, r: Rect, icon: Icon) {
                 ui.c.fill_rect(at(x + 13, y, 6, 12), soft);
                 ui.c.fill_rect(at(x + 5, y + 20, 10, 3), soft);
             }
+        }
+        Icon::Reports => {
+            // A bar chart on a baseline, rising to the right.
+            for (k, h) in [30, 48, 38, 62].into_iter().enumerate() {
+                let x = 20 + k as i32 * 16;
+                let b = at(x, 78 - h, 11, h);
+                ui.c.fill_round_rect(b, px(2), WHITE);
+                ui.c.fill_rect(at(x, 76, 11, 2), WHITE);
+            }
+            ui.c.fill_round_rect(at(14, 80, 72, 4), px(2), soft);
+        }
+        Icon::Settings => {
+            // A gear: teeth around a wheel with a hole.
+            let (cx, cy) = (r.x + px(50), r.y + px(50));
+            let t = px(14);
+            for (dx, dy) in DIRS {
+                let tx = cx + px(29) * dx / 100;
+                let ty = cy + px(29) * dy / 100;
+                ui.c.fill_round_rect(Rect::new(tx - t / 2, ty - t / 2, t, t), px(2), WHITE);
+            }
+            ui.c.fill_circle(cx, cy, px(27), WHITE);
+            ui.c.fill_circle(cx, cy, px(11), mix(top, bot, 128));
         }
     }
 }
@@ -385,37 +493,54 @@ pub(crate) fn draw_home(
         dock_w,
         dock_h,
     );
-    // Two app cards.
+    // Goal progress.
+    if let Some((caption, pct)) = &v.goal {
+        let gh = ui.c.line_height(Font::Bold) + 3 * u;
+        let gw = full.w.min(80 * u);
+        let gr = Rect::new((full.w - gw) / 2, y, gw, gh);
+        goal_bar(ui, gr, caption, *pct);
+        y += gh + 2 * u;
+    }
+    if !v.today.is_empty() {
+        let sh = ui.c.line_height(Font::Normal);
+        ui.label_color(
+            Rect::new(0, y, full.w, sh),
+            &v.today,
+            Font::Normal,
+            1,
+            mix(WHITE, 0, 40),
+        );
+        y += sh + 2 * u;
+    }
+    // App cards: only those this role may use, plus Settings.
+    let mut cards: Vec<(&str, &str, Icon, bool, char)> = Vec::new();
+    if v.can_till {
+        cards.push(("Till", &v.till_sub, Icon::Till, false, '1'));
+    }
+    if v.can_stock {
+        cards.push(("Inventory", &v.stock_sub, Icon::Stock, v.stock_alert, '2'));
+    }
+    if v.can_reports {
+        cards.push(("Reports", &v.reports_sub, Icon::Reports, false, '4'));
+    }
+    cards.push(("Settings", &v.settings_sub, Icon::Settings, false, '3'));
+    let n = cards.len() as i32;
+    let gap = 4 * u;
     let avail = dock.y - y - 3 * u;
     let card_h = avail.min(44 * u);
-    let card_w = (card_h * 9 / 10).min((full.w - 8 * u) / 2);
-    let gap = 4 * u;
-    let x0 = (full.w - 2 * card_w - gap) / 2;
+    let card_w = (card_h * 9 / 10).min((full.w - 4 * u - (n + 1) * gap) / n);
+    let x0 = (full.w - n * card_w - (n - 1) * gap) / 2;
     let y0 = y + (avail - card_h) / 2;
-    if app_card(
-        ui,
-        Rect::new(x0, y0, card_w, card_h),
-        "Till",
-        &v.till_sub,
-        Icon::Till,
-        false,
-    ) {
-        action = Some(UiAction::Key(Key::Char('1')));
-    }
-    if app_card(
-        ui,
-        Rect::new(x0 + card_w + gap, y0, card_w, card_h),
-        "Inventory",
-        &v.stock_sub,
-        Icon::Stock,
-        v.stock_alert,
-    ) {
-        action = Some(UiAction::Key(Key::Char('2')));
+    for (k, (name, sub, icon, alert, key)) in cards.into_iter().enumerate() {
+        let r = Rect::new(x0 + k as i32 * (card_w + gap), y0, card_w, card_h);
+        if app_card(ui, r, name, sub, icon, alert) {
+            action = Some(UiAction::Key(Key::Char(key)));
+        }
     }
     glass(ui, dock, 150);
     let cells = dock.inset(u).grid(2, 1, u);
     let font = Font::Bold;
-    if ui.button_font(cells[0], "Manager menu", pos_ui::ButtonStyle::Primary, font) {
+    if ui.button_font(cells[0], "Menu", pos_ui::ButtonStyle::Primary, font) {
         action = Some(UiAction::Key(Key::F(10)));
     }
     if ui.button_font(cells[1], "Sign out", pos_ui::ButtonStyle::Normal, font) {
@@ -469,6 +594,54 @@ const MONTHS: [&str; 12] = [
     "December",
 ];
 
+/// The clock screen saver: a dim clock on black that moves every minute
+/// so nothing burns into the panel.
+pub(crate) fn draw_saver(ui: &mut Ui<'_>, store: &str, now: i64) {
+    let u = ui.u();
+    let full = ui.c.bounds();
+    ui.c.fill_rect(full, 0);
+    let (time, date) = match pos_hal::DateTime::from_unix(now) {
+        Some(d) => (
+            format!("{:02}:{:02}", d.hour, d.minute),
+            format!(
+                "{}, {} {}",
+                DAYS[(now.div_euclid(86_400).rem_euclid(7)) as usize],
+                d.day,
+                MONTHS[usize::from(d.month.clamp(1, 12)) - 1]
+            ),
+        ),
+        None => ("--:--".into(), String::new()),
+    };
+    let huge = ui.c.line_height(Font::Huge);
+    let nh = ui.c.line_height(Font::Normal);
+    let bw = (ui.c.text_width(&time, Font::Huge) + 4 * u)
+        .max(ui.c.text_width(&date, Font::Normal) + 4 * u)
+        .min(full.w);
+    let bh = huge + 2 * nh + 2 * u;
+    // A new spot each minute (deterministic, spread over the screen).
+    let m = now.div_euclid(60) as u64;
+    let hx = (m.wrapping_mul(2_654_435_761) >> 7) as i32;
+    let hy = (m.wrapping_mul(40_503) >> 3) as i32;
+    let x = hx.rem_euclid((full.w - bw).max(1));
+    let y = hy.rem_euclid((full.h - bh).max(1));
+    let dim = 0x00B8_C0CC;
+    ui.label_color(Rect::new(x, y, bw, huge), &time, Font::Huge, 1, dim);
+    ui.label_color(
+        Rect::new(x, y + huge, bw, nh),
+        &date,
+        Font::Normal,
+        1,
+        mix(dim, 0, 90),
+    );
+    ui.label_color(
+        Rect::new(x, y + huge + nh + u, bw, nh),
+        store,
+        Font::Small,
+        1,
+        mix(dim, 0, 140),
+    );
+}
+
 /// Pictures the desktop screens draw.
 pub(crate) fn wanted<D: pos_hal::BlockDevice>(
     app: &crate::App<D>,
@@ -487,7 +660,6 @@ pub(crate) fn wanted<D: pos_hal::BlockDevice>(
 }
 
 pub(crate) fn view<D: pos_hal::BlockDevice>(app: &mut crate::App<D>, now: i64) -> DeskView {
-    use pos_core::auth::Role;
     use pos_core::media::PictureFor;
     let (w, h) = (app.canvas.width(), app.canvas.height());
     let wall = app.gallery.wallpaper(&app.state.pictures, w, h);
@@ -515,10 +687,7 @@ pub(crate) fn view<D: pos_hal::BlockDevice>(app: &mut crate::App<D>, now: i64) -
             (
                 u.id,
                 u.name.clone(),
-                match u.role {
-                    Role::Manager => "Manager",
-                    Role::Cashier => "Cashier",
-                },
+                u.role.label(),
                 app.gallery.get(&PictureFor::User(u.id)),
             )
         })
@@ -559,7 +728,38 @@ pub(crate) fn view<D: pos_hal::BlockDevice>(app: &mut crate::App<D>, now: i64) -
         let n = inv.tracked();
         format!("{n} product{} in stock", if n == 1 { "" } else { "s" })
     };
+    let me_id = app.user;
+    let can_till = app.can_use(crate::Place::Till);
+    let can_stock = app.can_use(crate::Place::Inventory);
+    let can_reports = app.can_use(crate::Place::Reports);
+    let reports_sub = match &app.state.shift {
+        Some(s) => format!(
+            "{} sales · {}",
+            s.counters.sales,
+            app.money(s.counters.sales_total)
+        ),
+        None => "Sales by hour · best sellers".into(),
+    };
+    let (goal, today) = shift_figures(app, me_id);
+    let settings_sub = match me_id {
+        Some(id)
+            if app
+                .state
+                .allows(id, pos_core::auth::Permission::ManageUsers) =>
+        {
+            let n = app.state.users.values().filter(|u| u.active).count();
+            format!("{n} user{} · roles · goal", if n == 1 { "" } else { "s" })
+        }
+        _ => "My PIN · about this till".into(),
+    };
     DeskView {
+        can_till,
+        can_stock,
+        can_reports,
+        reports_sub,
+        settings_sub,
+        goal,
+        today,
         wall,
         logo: app.gallery.get(&PictureFor::Logo),
         store: app.state.config.store_name.clone(),
@@ -577,6 +777,69 @@ pub(crate) fn view<D: pos_hal::BlockDevice>(app: &mut crate::App<D>, now: i64) -
         stock_alert: alerts > 0,
         net: net_line(app, now),
     }
+}
+
+/// Shift goal bar and a line of shift figures (sales from memory: the last
+/// receipts kept for reprints).
+fn shift_figures<D: pos_hal::BlockDevice>(
+    app: &crate::App<D>,
+    me: Option<u16>,
+) -> (Option<(String, u32)>, String) {
+    let Some(shift) = &app.state.shift else {
+        return (None, String::new());
+    };
+    let total = shift.counters.sales_total;
+    let goal = app.state.policy.shift_goal;
+    let mut mine = 0u32;
+    let mut sold: alloc::collections::BTreeMap<&str, i64> = alloc::collections::BTreeMap::new();
+    for j in &app.recent {
+        if let crate::Journaled::Sale(s, _) = j
+            && s.shift_id == shift.id
+        {
+            if Some(s.cashier) == me {
+                mine += 1;
+            }
+            for l in &s.lines {
+                *sold.entry(l.line.name.as_str()).or_default() += l.line.qty.0;
+            }
+        }
+    }
+    let mut parts = Vec::new();
+    if me.is_some() && mine > 0 {
+        parts.push(format!(
+            "You: {mine} sale{}",
+            if mine == 1 { "" } else { "s" }
+        ));
+    }
+    parts.push(format!(
+        "Shift {}: {} sales, {}",
+        shift.id,
+        shift.counters.sales,
+        app.money(total)
+    ));
+    if let Some((name, q)) = sold.iter().max_by_key(|(_, q)| **q) {
+        parts.push(format!("Top: {name} x{}", pos_core::Qty(*q)));
+    }
+    let today = parts.join("  ·  ");
+    if goal.is_zero() || goal.is_negative() {
+        return (None, today);
+    }
+    let pct = (total.0.max(0).saturating_mul(100) / goal.0.max(1)).min(999) as u32;
+    let caption = if pct >= 100 {
+        format!(
+            "Goal reached! {} of {} - {pct}%",
+            app.money(total),
+            app.money(goal)
+        )
+    } else {
+        format!(
+            "Shift goal: {} of {} ({pct}%) - {} to go",
+            app.money(total),
+            app.money(goal),
+            app.money(pos_core::Money(goal.0 - total.0))
+        )
+    };
+    (Some((caption, pct)), today)
 }
 
 fn net_line<D: pos_hal::BlockDevice>(app: &crate::App<D>, now: i64) -> String {

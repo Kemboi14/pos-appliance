@@ -418,6 +418,44 @@ pub fn journal_row(seq: u64, hash_hex: &str, e: &Event, cfg: &Config) -> String 
                 user.active
             ),
         ),
+        Event::UiSet { by, prefs, .. } => (
+            String::new(),
+            by.to_string(),
+            String::new(),
+            alloc::format!(
+                "theme={:?} accent={:?} text={:?} left_handed={} saver_min={}",
+                prefs.theme,
+                prefs.accent,
+                prefs.text,
+                prefs.left_handed,
+                prefs.saver_mins
+            ),
+        ),
+        // Never the password.
+        Event::WifiSet { by, wifi, .. } => (
+            String::new(),
+            by.to_string(),
+            String::new(),
+            match wifi {
+                Some(w) => alloc::format!("ssid={}", w.ssid),
+                None => String::from("forgotten"),
+            },
+        ),
+        Event::PolicySet { by, policy, .. } => (
+            String::new(),
+            by.to_string(),
+            policy.shift_goal.display(d).to_string(),
+            alloc::format!(
+                "roles={} idle_signout_min={}",
+                policy
+                    .roles
+                    .iter()
+                    .map(|(r, m)| alloc::format!("{r:?}:{m:#x}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                policy.idle_signout_mins
+            ),
+        ),
         Event::CatalogUpsert { by, item, .. } => (
             String::new(),
             by.to_string(),

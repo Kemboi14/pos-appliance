@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{App, Hw};
 
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 /// Movements per message.
 const BATCH: usize = 200;
 /// Don't queue more sections while this much is unsent to a lane.
@@ -242,7 +242,7 @@ impl<D: BlockDevice> App<D> {
             .collect();
         let rank = |k: &SectionKey| match k {
             SectionKey::Config => 0,
-            SectionKey::Users => 1,
+            SectionKey::Users | SectionKey::Policy => 1,
             SectionKey::Catalog => 2,
             SectionKey::Picture(_) => 3,
         };
@@ -255,6 +255,7 @@ impl<D: BlockDevice> App<D> {
             let section = match &k {
                 SectionKey::Config => Section::Config(st.config.clone()),
                 SectionKey::Users => Section::Users(st.users.values().cloned().collect()),
+                SectionKey::Policy => Section::Policy(st.policy.clone()),
                 SectionKey::Catalog => Section::Catalog(st.catalog.items().cloned().collect()),
                 SectionKey::Picture(p) => {
                     Section::Picture(p.clone(), st.pictures.get(p).map(|a| (**a).clone()))

@@ -30,10 +30,11 @@ impl Display for Disp {
     }
 }
 
-struct Clk(std::cell::Cell<i64>);
+/// Wall clock (Unix seconds) and monotonic clock (µs, follows input time).
+struct Clk(std::cell::Cell<i64>, std::cell::Cell<u64>);
 impl Clock for Clk {
     fn monotonic_us(&self) -> u64 {
-        0
+        self.1.get()
     }
     fn wall(&self) -> HalResult<DateTime> {
         DateTime::from_unix(self.0.get()).ok_or(HalError::Io)
@@ -182,17 +183,82 @@ struct Rig {
     printer: Prn,
     rng: Rnd,
     media: Media,
+    wifi: FakeWifi,
+    sound: Beeps,
     t_us: u64,
+}
+
+/// A Wi-Fi adapter with two networks; "Shop" takes the password "letmein123".
+#[derive(Default)]
+struct FakeWifi {
+    present: bool,
+    joined: Option<String>,
+    connects: u32,
+}
+
+impl Wifi for FakeWifi {
+    fn present(&self) -> bool {
+        self.present
+    }
+    fn describe(&self) -> String {
+        "test adapter, supplicant".into()
+    }
+    fn scan(&mut self) -> HalResult<Vec<WifiNetwork>> {
+        if !self.present {
+            return Err(HalError::NotPresent);
+        }
+        Ok(vec![
+            WifiNetwork {
+                ssid: "Cafe".into(),
+                quality: 30,
+                secured: false,
+            },
+            WifiNetwork {
+                ssid: "Shop".into(),
+                quality: 81,
+                secured: true,
+            },
+        ])
+    }
+    fn connect(&mut self, ssid: &str, password: &str) -> HalResult<()> {
+        self.connects += 1;
+        match (ssid, password) {
+            ("Shop", "letmein123") => {
+                self.joined = Some(ssid.into());
+                Ok(())
+            }
+            ("Shop", _) => Err(HalError::Refused),
+            _ => Err(HalError::NotFound),
+        }
+    }
+    fn disconnect(&mut self) -> HalResult<()> {
+        self.joined = None;
+        Ok(())
+    }
+    fn connected(&self) -> Option<String> {
+        self.joined.clone()
+    }
+}
+
+/// Records the tones asked for.
+#[derive(Default)]
+struct Beeps(Vec<(u32, u32)>);
+impl Sound for Beeps {
+    fn beep(&mut self, hz: u32, ms: u32) {
+        self.0.push((hz, ms));
+    }
 }
 
 impl Rig {
     fn new() -> Self {
         Rig {
             disp: Disp(1024, 768),
-            clock: Clk(std::cell::Cell::new(1_763_550_000)),
+            clock: Clk(std::cell::Cell::new(1_763_550_000), std::cell::Cell::new(0)),
             printer: Prn::default(),
             rng: Rnd(1),
             media: Media::default(),
+            wifi: FakeWifi::default(),
+            sound: Beeps::default(),
             t_us: 1_000_000,
         }
     }
@@ -203,11 +269,14 @@ impl Rig {
             printer: &mut self.printer,
             rng: &mut self.rng,
             media: &mut self.media,
+            wifi: &mut self.wifi,
+            sound: &mut self.sound,
         }
     }
     fn key<D: BlockDevice>(&mut self, app: &mut App<D>, k: Key, gap_us: u64) -> Control {
         self.t_us += gap_us;
         self.clock.0.set(self.clock.0.get() + 1);
+        self.clock.1.set(self.t_us);
         let at = self.t_us;
         let c = app.handle(
             InputEvent::Key {
@@ -260,11 +329,12 @@ SOAP,036000291452,,Soap,5.00,A,0,\n";
 fn bring_up<D: BlockDevice>(rig: &mut Rig, app: &mut App<D>) {
     rig.typ(app, "Alice\n1234\n1234\n");
     assert!(
-        app.message().unwrap_or("").contains("Manager created"),
+        app.message().unwrap_or("").contains("Welcome, Alice"),
         "{:?}",
         app.message()
     );
-    rig.typ(app, "1\n1234\n\n"); // login manager
+    // Signed in straight away; store name left as it is, then the Till.
+    rig.typ(app, "\n\n");
     rig.typ(app, "100.00\n"); // float
     assert!(matches!(app.screen(), Screen::Sale), "{:?}", app.screen());
     rig.media
@@ -274,7 +344,7 @@ fn bring_up<D: BlockDevice>(rig: &mut Rig, app: &mut App<D>) {
     rig.typ(app, "8"); // import catalog
     assert_eq!(app.state().catalog.len(), 4, "{:?}", app.message());
     rig.key(app, Key::F(10), 100_000);
-    rig.typ(app, "0Bob\n0000\n"); // add cashier
+    rig.typ(app, "0Bob\n3\n0000\n0000\n"); // add user: Bob, cashier
     assert_eq!(app.state().users.len(), 2, "{:?}", app.message());
 }
 
@@ -602,7 +672,13 @@ fn touch_only_day(w: u32, h: u32) {
         &mut app,
         &["1", "2", "3", "4", "OK", "1", "2", "3", "4", "OK"],
     );
-    assert!(app.message().unwrap_or("").contains("Manager created"));
+    assert!(app.message().unwrap_or("").contains("Welcome, Alice"));
+    // Signed straight in; name the store on the on-screen keyboard.
+    rig.shot(&app, "t1b_store_name");
+    rig.taps(&mut app, &["D", "u", "k", "a", "OK"]);
+    assert_eq!(app.state().config.store_name, "Duka");
+    assert!(matches!(app.screen(), Screen::Home), "{:?}", app.screen());
+    rig.tap(&mut app, "Sign out");
 
     // Sign in by tapping the name tile.
     rig.shot(&app, "t2_login");
@@ -921,4 +997,349 @@ fn inventory_by_touch() {
     rig.tap(&mut app, "Home");
     rig.tap(&mut app, "Sign out");
     assert!(matches!(app.screen(), Screen::Prompt(_)));
+}
+
+/// Find a settings row by its label and tap it.
+fn tap_row<D: BlockDevice>(rig: &mut Rig, app: &mut App<D>, label: &str) {
+    rig.tap(app, label);
+}
+
+#[test]
+fn roles_settings_and_name_sign_in() {
+    use pos_core::Money;
+    use pos_core::auth::{Permission, Role};
+    let mut rig = Rig::new();
+    let (mut app, _) = boot(fresh_device());
+    bring_up(&mut rig, &mut app);
+    let bob = 2;
+    assert_eq!(app.state().users[&bob].role, Role::Cashier);
+
+    // Sign in by name, any case, first name or the start of it.
+    for typed in ["bob", "BOB", "Bo", "2"] {
+        rig.key(&mut app, Key::Home, 100_000);
+        rig.key(&mut app, Key::F(12), 100_000);
+        rig.typ(&mut app, &format!("{typed}\n0000\n"));
+        assert!(
+            matches!(app.screen(), Screen::Home),
+            "{typed}: {:?} {:?}",
+            app.screen(),
+            app.message()
+        );
+    }
+    // Unknown names list who can sign in.
+    rig.key(&mut app, Key::F(12), 100_000);
+    rig.typ(&mut app, "Carol\n");
+    let m = app.message().unwrap_or("").to_string();
+    assert!(m.contains("No user called") && m.contains("1=Alice"), "{m}");
+
+    // A cashier opens Settings: users need a manager override.
+    rig.typ(&mut app, "2\n0000\n");
+    rig.key(&mut app, Key::Char('3'), 100_000);
+    assert!(matches!(app.screen(), Screen::Settings { .. }));
+    rig.shot(&app, "s0_settings_cashier");
+    tap_row(&mut rig, &mut app, "Users");
+    assert!(
+        matches!(app.screen(), Screen::Prompt(_)),
+        "{:?}",
+        app.screen()
+    );
+    rig.typ(&mut app, "1\n1234\n");
+    assert!(
+        matches!(app.screen(), Screen::Settings { by: 1, .. }),
+        "{:?} {:?}",
+        app.screen(),
+        app.message()
+    );
+    rig.shot(&app, "s1_users");
+    // Make Bob a supervisor: taps cycle Manager, Supervisor, Cashier,
+    // Stock clerk.
+    tap_row(&mut rig, &mut app, "Bob  (#2)");
+    tap_row(&mut rig, &mut app, "Role (tap to change)");
+    assert_eq!(app.state().users[&bob].role, Role::StockClerk);
+    tap_row(&mut rig, &mut app, "Role (tap to change)");
+    tap_row(&mut rig, &mut app, "Role (tap to change)");
+    assert_eq!(app.state().users[&bob].role, Role::Supervisor);
+    rig.shot(&app, "s2_user");
+
+    // Bob's new rights apply at once: a supervisor may refund alone.
+    assert!(app.state().allows(bob, Permission::Refund));
+    rig.key(&mut app, Key::Escape, 100_000);
+    rig.key(&mut app, Key::Escape, 100_000);
+    rig.key(&mut app, Key::Escape, 100_000);
+    assert!(matches!(app.screen(), Screen::Home), "{:?}", app.screen());
+    rig.key(&mut app, Key::F(12), 100_000);
+
+    // Alice: roles page, let cashiers do refunds, set a goal and idle limit.
+    rig.typ(&mut app, "alice\n1234\n");
+    rig.key(&mut app, Key::Char('3'), 100_000);
+    tap_row(&mut rig, &mut app, "Roles & permissions");
+    tap_row(&mut rig, &mut app, "Cashier");
+    rig.shot(&app, "s3_role");
+    assert!(!app.state().policy.allows(Role::Cashier, Permission::Refund));
+    tap_row(&mut rig, &mut app, "Refund");
+    assert!(app.state().policy.allows(Role::Cashier, Permission::Refund));
+    // Manager-only rights cannot be granted.
+    tap_row(&mut rig, &mut app, "Users");
+    assert!(
+        !app.state()
+            .policy
+            .allows(Role::Cashier, Permission::ManageUsers)
+    );
+    rig.key(&mut app, Key::Escape, 100_000);
+    rig.key(&mut app, Key::Escape, 100_000);
+    tap_row(&mut rig, &mut app, "Shift sales goal");
+    rig.typ(&mut app, "20.00\n");
+    assert_eq!(app.state().policy.shift_goal, Money(2000));
+    tap_row(&mut rig, &mut app, "Automatic sign-out");
+    rig.tap(&mut app, "5 min");
+    assert_eq!(app.state().policy.idle_signout_mins, 5);
+
+    // Change my PIN (wrong old PIN is refused).
+    tap_row(&mut rig, &mut app, "My PIN");
+    rig.typ(&mut app, "9999\n");
+    assert_eq!(app.message(), Some("Wrong PIN"));
+    tap_row(&mut rig, &mut app, "My PIN");
+    rig.typ(&mut app, "1234\n4321\n4321\n");
+    assert_eq!(app.message(), Some("Your PIN is changed"));
+
+    // The goal: sell past it from the till and see the celebration.
+    rig.key(&mut app, Key::Home, 100_000);
+    rig.shot(&app, "s4_home_goal");
+    rig.key(&mut app, Key::Char('1'), 100_000);
+    rig.typ(&mut app, "4*SOAP\n");
+    rig.key(&mut app, Key::F(1), 100_000);
+    rig.typ(&mut app, "20.00\n");
+    assert!(
+        app.message().unwrap_or("").contains("goal"),
+        "{:?} {:?}",
+        app.screen(),
+        app.message()
+    );
+    rig.key(&mut app, Key::Enter, 100_000);
+    rig.key(&mut app, Key::Home, 100_000);
+    rig.shot(&app, "s5_goal_reached");
+
+    // Idle for 5 minutes: signed out.
+    rig.t_us += 5 * 60_000_000;
+    rig.clock.1.set(rig.t_us);
+    app.tick(&mut rig.hw());
+    assert!(
+        app.message()
+            .unwrap_or("")
+            .contains("Signed out after 5 minutes"),
+        "{:?}",
+        app.message()
+    );
+    rig.typ(&mut app, "1\n4321\n");
+    assert!(matches!(app.screen(), Screen::Home), "{:?}", app.message());
+
+    // Everything survives a reboot (policy from events and snapshot).
+    let policy = app.state().policy.clone();
+    let dev = MemDeviceExt::take(app);
+    let (app, st) = boot(dev);
+    assert_eq!(st, BootStatus::Ready);
+    assert_eq!(app.state().policy, policy);
+    assert_eq!(app.state().users[&bob].role, Role::Supervisor);
+}
+
+#[test]
+fn reports_quick_cash_and_menu() {
+    let mut rig = Rig::new();
+    let (mut app, _) = boot(fresh_device());
+    bring_up(&mut rig, &mut app);
+    // Sales spread over three hours; pay with the quick-cash buttons.
+    for (k, code) in ["4006381333931", "96385074", "036000291452"]
+        .iter()
+        .enumerate()
+    {
+        rig.clock
+            .0
+            .set(rig.clock.0.get() + 3600 * (k as i64 % 2 + 1));
+        rig.scan(&mut app, code);
+        rig.scan(&mut app, code);
+        rig.key(&mut app, Key::F(1), 100_000);
+        if k == 0 {
+            rig.shot(&app, "r0_pay_quick");
+        }
+        let exact = app
+            .tap_targets()
+            .iter()
+            .find(|(_, l)| l.starts_with("Exact"))
+            .map(|(_, l)| l.clone())
+            .expect("exact button");
+        let label = if k == 2 {
+            // 10.00 due: the next button up is 15.00 or 20.00.
+            app.tap_targets()
+                .iter()
+                .map(|(_, l)| l.clone())
+                .find(|l| l == "20.00")
+                .expect("20.00 button")
+        } else {
+            exact
+        };
+        rig.tap(&mut app, &label);
+        assert!(
+            matches!(app.screen(), Screen::Done { .. }),
+            "{:?} {:?}",
+            app.screen(),
+            app.message()
+        );
+        if k == 2 {
+            match app.screen() {
+                Screen::Done { change, .. } => assert_eq!(change.0, 10_00),
+                _ => unreachable!(),
+            }
+        }
+        rig.key(&mut app, Key::Escape, 100_000);
+    }
+    let st = app.state().stats.clone();
+    assert_eq!(st.hours.values().map(|h| h.0).sum::<u32>(), 3);
+    assert_eq!(st.top_items(1)[0].0, "SOAP");
+    assert_eq!(st.cashiers[&1].0, 3);
+
+    // Reports from the home screen; tap a bar for its figures.
+    rig.key(&mut app, Key::Home, 100_000);
+    rig.shot(&app, "r1_home");
+    rig.tap(&mut app, "Reports");
+    assert!(matches!(app.screen(), Screen::Reports { hour: None }));
+    rig.shot(&app, "r2_reports");
+    let h = *st.hours.keys().next().unwrap();
+    rig.tap(&mut app, &format!("hour {h:02}"));
+    assert!(matches!(app.screen(), Screen::Reports { hour: Some(x) } if *x == h));
+    rig.shot(&app, "r3_reports_hour");
+    // Stats survive a reboot.
+    let stats = app.state().stats.clone();
+    let dev = MemDeviceExt::take(app);
+    let (mut app, _) = boot(dev);
+    assert_eq!(app.state().stats, stats);
+
+    // A cashier sees Reports (cashiers may take X reports); the menu
+    // marks what needs approval.
+    rig.typ(&mut app, "bob\n0000\n");
+    assert!(app.tap_targets().iter().any(|(_, l)| l == "Reports"));
+    rig.tap(&mut app, "Menu");
+    rig.shot(&app, "r4_menu_cashier");
+    assert!(matches!(app.screen(), Screen::Menu { .. }));
+}
+
+fn tick<D: BlockDevice>(rig: &mut Rig, app: &mut App<D>) {
+    app.tick(&mut rig.hw());
+    app.render(&mut rig.hw());
+}
+
+#[test]
+fn display_sound_saver_and_wifi() {
+    use pos_core::ui::{Accent, TextSize, ThemeMode};
+    let mut rig = Rig::new();
+    rig.wifi.present = true;
+    let (mut app, _) = boot(fresh_device());
+    bring_up(&mut rig, &mut app);
+
+    // Beep on scan is on by default: high for a hit, low for a miss.
+    rig.scan(&mut app, "4006381333931");
+    rig.typ(&mut app, "NOPE\n");
+    assert!(rig.sound.0.contains(&(1800, 45)), "{:?}", rig.sound.0);
+    assert!(rig.sound.0.contains(&(320, 160)), "{:?}", rig.sound.0);
+    rig.key(&mut app, Key::F(8), 100_000); // void the sale (manager)
+    rig.key(&mut app, Key::Home, 100_000);
+
+    // Display & sound.
+    rig.key(&mut app, Key::Char('3'), 100_000);
+    rig.tap(&mut app, "Display & sound");
+    rig.shot(&app, "d0_display_dark");
+    rig.tap(&mut app, "Theme");
+    rig.tap(&mut app, "Accent colour");
+    rig.tap(&mut app, "Text size");
+    rig.tap(&mut app, "Sale screen");
+    rig.tap(&mut app, "Key click");
+    let ui = app.state().ui.clone();
+    assert_eq!(ui.theme, ThemeMode::Light);
+    assert_eq!(ui.accent, Accent::Green);
+    assert_eq!(ui.text, TextSize::Large);
+    assert!(ui.left_handed && ui.key_click);
+    assert_eq!(app.canvas().text_scale(), 1150);
+    rig.shot(&app, "d1_display_light");
+    rig.tap(&mut app, "Screen saver");
+    rig.tap(&mut app, "2 min");
+    assert_eq!(app.state().ui.saver_mins, 2);
+    rig.sound.0.clear();
+    rig.tap(&mut app, "Test the speaker");
+    assert_eq!(rig.sound.0.len(), 3, "{:?}", rig.sound.0); // click + 2 tones
+
+    // The light, left-handed sale screen.
+    rig.key(&mut app, Key::Home, 100_000);
+    rig.key(&mut app, Key::Char('1'), 100_000);
+    rig.scan(&mut app, "96385074");
+    rig.shot(&app, "d2_sale_light_left");
+    rig.key(&mut app, Key::F(8), 100_000);
+    rig.key(&mut app, Key::Home, 100_000);
+    rig.shot(&app, "d3_home_light");
+
+    // Screen saver after 2 idle minutes; the waking key does nothing else.
+    rig.t_us += 2 * 60_000_000;
+    rig.clock.1.set(rig.t_us);
+    tick(&mut rig, &mut app);
+    assert!(app.saver_on());
+    rig.shot(&app, "d4_saver");
+    rig.key(&mut app, Key::Char('1'), 100_000);
+    assert!(!app.saver_on());
+    assert!(matches!(app.screen(), Screen::Home), "{:?}", app.screen());
+
+    // Wi-Fi: scan, refuse open networks, wrong then right password.
+    rig.key(&mut app, Key::Char('3'), 100_000);
+    rig.tap(&mut app, "Wi-Fi");
+    rig.tap(&mut app, "Scan for networks");
+    tick(&mut rig, &mut app);
+    rig.shot(&app, "d5_wifi_scan");
+    rig.tap(&mut app, "Cafe");
+    assert!(app.message().unwrap_or("").contains("Open networks"));
+    rig.tap(&mut app, "Shop");
+    rig.typ(&mut app, "wrongpass1\n");
+    tick(&mut rig, &mut app);
+    assert!(
+        app.message().unwrap_or("").contains("password"),
+        "{:?}",
+        app.message()
+    );
+    assert!(app.state().wifi.is_none());
+    rig.tap(&mut app, "Shop");
+    rig.typ(&mut app, "letmein123\n");
+    tick(&mut rig, &mut app);
+    assert_eq!(app.state().wifi.as_ref().unwrap().ssid, "Shop");
+    assert!(app.wifi_preferred());
+    rig.shot(&app, "d6_wifi_connected");
+    // The password never reaches the exported journal.
+    rig.key(&mut app, Key::Home, 100_000);
+    rig.key(&mut app, Key::F(10), 100_000);
+    rig.typ(&mut app, "7");
+    let journal: String = rig
+        .media
+        .0
+        .iter()
+        .filter(|(k, _)| k.starts_with('J'))
+        .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+        .collect();
+    assert!(journal.contains("ssid=Shop"), "{journal}");
+    assert!(!journal.contains("letmein123"));
+
+    // After a reboot the till rejoins on its first tick, before the store
+    // network may open its adapter.
+    let prefs = app.state().ui.clone();
+    let dev = MemDeviceExt::take(app);
+    rig.wifi.joined = None;
+    let (mut app, _) = boot(dev);
+    assert_eq!(app.state().ui, prefs);
+    assert!(!app.wifi_settled());
+    tick(&mut rig, &mut app);
+    assert!(app.wifi_settled());
+    assert_eq!(rig.wifi.joined.as_deref(), Some("Shop"));
+
+    // Forget it.
+    rig.typ(&mut app, "1\n1234\n");
+    rig.key(&mut app, Key::Char('3'), 100_000);
+    rig.tap(&mut app, "Wi-Fi");
+    rig.tap(&mut app, "Forget this network");
+    tick(&mut rig, &mut app);
+    assert!(app.state().wifi.is_none());
+    assert!(rig.wifi.joined.is_none());
 }

@@ -21,6 +21,7 @@ use pos_store::Trust;
 use pos_ui::scan::Enter;
 use pos_ui::{ButtonStyle, Font, PointerFrame, Rect, Ui};
 
+use crate::admin::{self, AdminAct, SetPage};
 use crate::receipt;
 use crate::stock::{self, StockOp};
 use crate::{App, AppError, BootStatus, Hw, Journaled, Place};
@@ -45,7 +46,7 @@ pub enum Pending {
     Export,
     ImportCatalog,
     ImportSettings,
-    AddUser(Role),
+    Admin(AdminAct),
     Unlock,
     Stock(StockOp),
     ExportStock,
@@ -67,7 +68,7 @@ impl Pending {
             Pending::Export => Permission::Export,
             Pending::ImportCatalog => Permission::Import,
             Pending::ImportSettings => Permission::Configure,
-            Pending::AddUser(_) => Permission::ManageUsers,
+            Pending::Admin(a) => a.permission(),
             Pending::Unlock => Permission::UnlockUser,
             Pending::Stock(_) => Permission::Stock,
             Pending::ExportStock => Permission::Export,
@@ -100,9 +101,23 @@ pub enum Next {
     RefundReason(u64, Vec<(u16, Qty)>),
     RefundPayout(u64, Vec<(u16, Qty)>, String),
     RefundCardRef(u64, Vec<(u16, Qty)>, String),
-    AddUserName(Role),
-    AddUserPin(Role, String),
-    UnlockUser,
+    UnlockUser(UserId),
+    // Settings (see `admin`); the last UserId is who authorised it.
+    NewUserName(UserId),
+    NewUserRole(String, UserId),
+    NewUserPin(String, Role, UserId),
+    NewUserPin2(String, Role, String, UserId),
+    RenameUser(UserId, UserId),
+    ResetPin(UserId, UserId),
+    ResetPin2(UserId, String, UserId),
+    MyPinOld,
+    MyPinNew,
+    MyPinNew2(String),
+    Goal(UserId),
+    IdleMins(UserId),
+    StoreName(UserId),
+    SaverMins(UserId),
+    WifiPassword(String, UserId),
     StockSearch,
     StockReceiveQty(String),
     StockReceiveCost(String, Qty),
@@ -156,7 +171,10 @@ impl Next {
             | Next::VoucherCode
             | Next::RefundReason(..)
             | Next::RefundCardRef(..)
-            | Next::AddUserName(_)
+            | Next::NewUserName(_)
+            | Next::RenameUser(..)
+            | Next::StoreName(_)
+            | Next::WifiPassword(..)
             | Next::StockSearch
             | Next::NetKey(_)
             | Next::NetAddress(_)
@@ -169,12 +187,22 @@ impl Next {
             | Next::StockReceiveCost(..)
             | Next::StockCount(_)
             | Next::StockWriteOffQty(_)
-            | Next::StockReorder(_) => Input::Amount,
+            | Next::StockReorder(_)
+            | Next::Goal(_) => Input::Amount,
             Next::AdoptUser
             | Next::AdoptPin(_)
             | Next::SetupPin1(_)
             | Next::SetupPin2(..)
-            | Next::AddUserPin(..)
+            | Next::NewUserRole(..)
+            | Next::NewUserPin(..)
+            | Next::NewUserPin2(..)
+            | Next::ResetPin(..)
+            | Next::ResetPin2(..)
+            | Next::MyPinOld
+            | Next::MyPinNew
+            | Next::MyPinNew2(_)
+            | Next::IdleMins(_)
+            | Next::SaverMins(_)
             | Next::LoginUser
             | Next::LoginPin(_)
             | Next::OverrideUser(_)
@@ -185,7 +213,7 @@ impl Next {
             | Next::StockWriteOffReason(..)
             | Next::NetRole
             | Next::NetTill(_)
-            | Next::UnlockUser => Input::Digits,
+            | Next::UnlockUser(_) => Input::Digits,
         }
     }
 
@@ -205,7 +233,7 @@ impl Next {
 
     fn max_len(&self) -> usize {
         match self {
-            Next::NetKey(_) => 80,
+            Next::NetKey(_) | Next::WifiPassword(..) => 80,
             _ => 40,
         }
     }
@@ -219,7 +247,11 @@ impl Next {
             | Next::RefundCardRef(..)
             | Next::NetKey(_) => Shift::Lock,
             // Names and reasons start with a capital.
-            Next::SetupName | Next::AddUserName(_) | Next::RefundReason(..) => Shift::Once,
+            Next::SetupName
+            | Next::NewUserName(_)
+            | Next::RenameUser(..)
+            | Next::StoreName(_)
+            | Next::RefundReason(..) => Shift::Once,
             _ => Shift::Off,
         }
     }
@@ -258,6 +290,16 @@ pub enum Screen {
     Stock,
     /// Inventory: one product.
     StockItem(String),
+    /// The Settings app; `by` authorised it (the user, or an override).
+    Settings {
+        page: SetPage,
+        sel: usize,
+        by: UserId,
+    },
+    /// The Reports app; `hour` is the tapped bar.
+    Reports {
+        hour: Option<u8>,
+    },
 }
 
 pub(crate) fn prompt(title: &str, hint: &str, secret: bool, next: Next) -> Screen {
@@ -319,7 +361,7 @@ fn login_prompt<D: BlockDevice>(app: &App<D>) -> Screen {
     prompt(
         "Sign in",
         &format!(
-            "Tap your name, or type your user number ({})",
+            "Tap your name, or type your name or user number ({})",
             users.join(", ")
         ),
         false,
@@ -388,16 +430,30 @@ pub(crate) fn on_key<D: BlockDevice>(
         Screen::Home => home_key(app, key, hw),
         Screen::Stock => stock::list_key(app, key, at, hw),
         Screen::StockItem(sku) => stock::item_key(app, sku, key),
+        Screen::Settings { page, sel, by } => admin::key(app, page, sel, by, key, hw),
+        Screen::Reports { hour } => crate::reports::key(app, hour, key, hw),
     };
 }
 
 fn home_key<D: BlockDevice>(app: &mut App<D>, key: Key, hw: &mut Hw<'_>) -> Screen {
     match key {
         Key::Char('1') | Key::Enter => {
+            if !app.can_use(Place::Till) {
+                app.set_msg("Your role does not include selling", true);
+                return Screen::Home;
+            }
             app.place = Place::Till;
             back_to_work(app)
         }
         Key::Char('2') => stock::open(app),
+        Key::Char('3') => admin::open(app),
+        Key::Char('4') => {
+            if !app.can_use(Place::Reports) {
+                app.set_msg("Your role does not include reports", true);
+                return Screen::Home;
+            }
+            crate::reports::open(app)
+        }
         Key::F(10) => Screen::Menu { sel: 0 },
         Key::F(12) => sign_out(app, hw),
         _ => Screen::Home,
@@ -424,11 +480,13 @@ pub(crate) fn go_home<D: BlockDevice>(app: &mut App<D>) -> Screen {
     Screen::Home
 }
 
-fn back_to_work<D: BlockDevice>(app: &App<D>) -> Screen {
+pub(crate) fn back_to_work<D: BlockDevice>(app: &App<D>) -> Screen {
     match app.user {
         None => login_prompt(app),
         Some(_) if app.place == Place::Home => Screen::Home,
         Some(_) if app.place == Place::Inventory => Screen::Stock,
+        Some(me) if app.place == Place::Settings => admin::page(SetPage::Main, me),
+        Some(_) if app.place == Place::Reports => Screen::Reports { hour: None },
         Some(_) if app.state.shift.is_none() => prompt(
             "Open shift",
             "Opening cash float (e.g. 100.00), Enter",
@@ -477,7 +535,8 @@ fn prompt_key<D: BlockDevice>(
             | Next::StockWriteOffQty(s)
             | Next::StockWriteOffReason(s, _)
             | Next::StockReorder(s) => Screen::StockItem(s),
-            _ => back_to_work(app),
+            Next::UnlockUser(_) => back_to_work(app),
+            n => admin::return_to(app, &n).unwrap_or_else(|| back_to_work(app)),
         },
         Key::Enter => {
             let field = core::mem::take(&mut p.field);
@@ -492,7 +551,7 @@ fn random<const N: usize>(hw: &mut Hw<'_>) -> Option<[u8; N]> {
     hw.rng.fill(&mut b).ok().map(|_| b)
 }
 
-fn make_user<D: BlockDevice>(
+pub(crate) fn make_user<D: BlockDevice>(
     app: &App<D>,
     hw: &mut Hw<'_>,
     id: UserId,
@@ -516,6 +575,55 @@ fn make_user<D: BlockDevice>(
 
 fn parse_user(s: &str) -> Option<UserId> {
     s.trim().parse().ok()
+}
+
+/// Sign-in by user number or by name: exact name, then first name, then a
+/// unique start of a name, ignoring case.
+fn find_user<D: BlockDevice>(app: &App<D>, typed: &str) -> Result<UserId, String> {
+    let t = typed.trim();
+    let active = || app.state.users.values().filter(|u| u.active);
+    let list = || {
+        active()
+            .map(|u| format!("{}={}", u.id, u.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if t.is_empty() {
+        return Err(format!("Tap your name or type your number ({})", list()));
+    }
+    if let Some(id) = parse_user(t) {
+        return match app.state.users.get(&id) {
+            Some(u) if u.active => Ok(id),
+            Some(u) => Err(format!("{} is disabled - ask a manager", u.name)),
+            None => Err(format!("No user number {id}. Users: {}", list())),
+        };
+    }
+    let lower = t.to_lowercase();
+    let pick = |f: &dyn Fn(&User) -> bool| -> Vec<UserId> {
+        active().filter(|u| f(u)).map(|u| u.id).collect()
+    };
+    for found in [
+        pick(&|u| u.name.to_lowercase() == lower),
+        pick(&|u| {
+            u.name
+                .split_whitespace()
+                .next()
+                .is_some_and(|f| f.to_lowercase() == lower)
+        }),
+        pick(&|u| u.name.to_lowercase().starts_with(&lower)),
+    ] {
+        match found.as_slice() {
+            [one] => return Ok(*one),
+            [] => {}
+            _ => {
+                return Err(format!(
+                    "More than one \"{t}\": use the number ({})",
+                    list()
+                ));
+            }
+        }
+    }
+    Err(format!("No user called \"{t}\". Users: {}", list()))
 }
 
 fn parse_qty(s: &str) -> Option<Qty> {
@@ -650,29 +758,55 @@ fn submit<D: BlockDevice>(app: &mut App<D>, p: Prompt, field: String, hw: &mut H
             let Some(user) = make_user(app, hw, 1, &name, Role::Manager, &pin1) else {
                 return Screen::Fatal("No entropy source".into());
             };
-            match app.commit(vec![Event::UserSet {
-                by: None,
-                at: now,
-                user,
-            }]) {
+            let first = name.split_whitespace().next().unwrap_or("").to_string();
+            match app.commit(vec![
+                Event::UserSet {
+                    by: None,
+                    at: now,
+                    user,
+                },
+                Event::LoginOk { user: 1, at: now },
+            ]) {
                 Ok(_) => {
-                    app.set_msg("Manager created. Sign in.", false);
-                    login_prompt(app)
+                    // The manager just chose the PIN: sign them straight in.
+                    app.user = Some(1);
+                    app.place = Place::Home;
+                    app.set_msg(
+                        format!(
+                            "Welcome, {first}! Next time tap your name (or type 1) and enter your PIN"
+                        ),
+                        false,
+                    );
+                    prompt(
+                        "Name your store",
+                        "Shown on the home screen and on receipts. Leave empty to set it later                          in Settings.",
+                        false,
+                        Next::StoreName(1),
+                    )
                 }
                 Err(e) => {
+                    // Nothing was saved: let them try again.
                     app.err(&e);
-                    Screen::Fatal(crate::describe(&e))
+                    prompt(
+                        "First-time setup",
+                        "Enter the manager's name (this creates the first manager account)",
+                        false,
+                        Next::SetupName,
+                    )
                 }
             }
         }
-        Next::LoginUser => match parse_user(&field) {
-            Some(u) if app.state.users.get(&u).is_some_and(|x| x.active) => prompt(
+        Next::LoginUser => match find_user(app, &field) {
+            Ok(u) => prompt(
                 "Sign in",
                 &format!("PIN for {}", app.user_name(u)),
                 true,
                 Next::LoginPin(u),
             ),
-            _ => again(p, app, "Unknown user"),
+            Err(msg) => {
+                app.set_msg(msg, true);
+                login_prompt(app)
+            }
         },
         Next::LoginPin(u) => match app.state.login(u, field.as_bytes(), &*app.hasher, now) {
             Ok((ev, ok)) => match app.commit(vec![ev]) {
@@ -885,38 +1019,8 @@ fn submit<D: BlockDevice>(app: &mut App<D>, p: Prompt, field: String, hw: &mut H
                 hw,
             )
         }
-        Next::AddUserName(role) => {
-            if field.trim().is_empty() || field.chars().count() > 24 {
-                return again(p, app, "Name: 1-24 characters");
-            }
-            prompt(
-                "New user",
-                "4-8 digit PIN",
-                true,
-                Next::AddUserPin(role, field),
-            )
-        }
-        Next::AddUserPin(role, name) => {
-            if !auth::valid_pin(field.as_bytes()) {
-                return again(p, app, "PIN must be 4-8 digits");
-            }
-            let id = app.state.users.keys().max().copied().unwrap_or(0) + 1;
-            let (Some(by), Some(user)) = (app.user, make_user(app, hw, id, &name, role, &field))
-            else {
-                return back_to_work(app);
-            };
-            match app.commit(vec![Event::UserSet {
-                by: Some(by),
-                at: now,
-                user,
-            }]) {
-                Ok(_) => app.set_msg(format!("User {id} ({name}) created"), false),
-                Err(e) => app.err(&e),
-            }
-            back_to_work(app)
-        }
-        Next::UnlockUser => match (parse_user(&field), app.user) {
-            (Some(u), Some(by)) => {
+        Next::UnlockUser(by) => match parse_user(&field) {
+            Some(u) => {
                 match app.commit(vec![Event::UserUnlocked {
                     user: u,
                     by,
@@ -927,8 +1031,23 @@ fn submit<D: BlockDevice>(app: &mut App<D>, p: Prompt, field: String, hw: &mut H
                 }
                 back_to_work(app)
             }
-            _ => again(p, app, "User number"),
+            None => again(p, app, "User number"),
         },
+        Next::NewUserName(_)
+        | Next::NewUserRole(..)
+        | Next::NewUserPin(..)
+        | Next::NewUserPin2(..)
+        | Next::RenameUser(..)
+        | Next::ResetPin(..)
+        | Next::ResetPin2(..)
+        | Next::MyPinOld
+        | Next::MyPinNew
+        | Next::MyPinNew2(_)
+        | Next::Goal(_)
+        | Next::IdleMins(_)
+        | Next::SaverMins(_)
+        | Next::WifiPassword(..)
+        | Next::StoreName(_) => admin::submit(app, p, field, now, hw),
         Next::NetRole => match field.trim() {
             "1" => {
                 let ev = Event::NetConfigured {
@@ -1184,7 +1303,7 @@ fn finish_network<D: BlockDevice>(
     }
 }
 
-fn network_info<D: BlockDevice>(app: &App<D>) -> Screen {
+pub(crate) fn network_info<D: BlockDevice>(app: &App<D>) -> Screen {
     let n = &app.state.net;
     let s = &app.state.sync;
     let mut lines = vec![format!(
@@ -1503,14 +1622,14 @@ fn execute<D: BlockDevice>(
             }
             back_to_work(app)
         }
-        Pending::AddUser(role) => {
+        Pending::Admin(a) => {
             if !events.is_empty()
                 && let Err(e) = app.commit(events)
             {
                 app.err(&e);
                 return back_to_work(app);
             }
-            prompt("New user", "Name", false, Next::AddUserName(role))
+            admin::run(app, a, by)
         }
         Pending::Unlock => {
             if !events.is_empty()
@@ -1523,7 +1642,7 @@ fn execute<D: BlockDevice>(
                 "Unlock user",
                 "User number to unlock",
                 false,
-                Next::UnlockUser,
+                Next::UnlockUser(by),
             )
         }
         Pending::Stock(op) => {
@@ -1671,11 +1790,18 @@ fn add_code<D: BlockDevice>(app: &mut App<D>, code: &str) {
                 Ok(i) => {
                     app.sel = Some(i);
                     app.message = Some((format!("+ {name}"), false));
+                    app.chirp(crate::Chirp::Found);
                 }
-                Err(e) => app.set_msg(format!("{e:?}"), true),
+                Err(e) => {
+                    app.set_msg(format!("{e:?}"), true);
+                    app.chirp(crate::Chirp::Missing);
+                }
             }
         }
-        None => app.set_msg(format!("Not found: {code}"), true),
+        None => {
+            app.set_msg(format!("Not found: {code}"), true);
+            app.chirp(crate::Chirp::Missing);
+        }
     }
 }
 
@@ -1903,6 +2029,7 @@ fn finish_sale<D: BlockDevice>(app: &mut App<D>, pay: Payment, hw: &mut Hw<'_>) 
         app.err(&AppError::Fiscal(f.0));
         return Screen::Pay;
     }
+    let before = app.state.shift.as_ref().map(|s| s.counters.sales_total);
     let committed = match app.commit(vec![Event::SaleCompleted(sale.clone())]) {
         Ok(c) => c,
         Err(e) => {
@@ -1927,6 +2054,22 @@ fn finish_sale<D: BlockDevice>(app: &mut App<D>, pay: Payment, hw: &mut Hw<'_>) 
     // Drop the last "+ item" notice, but keep warnings (e.g. a printer error).
     if matches!(app.message, Some((_, false))) {
         app.message = None;
+    }
+    let goal = app.state.policy.shift_goal;
+    let after = app.state.shift.as_ref().map(|s| s.counters.sales_total);
+    if let (Some(b), Some(a)) = (before, after)
+        && !goal.is_zero()
+        && b < goal
+        && a >= goal
+    {
+        let first = name.split_whitespace().next().unwrap_or("").to_string();
+        app.set_msg(
+            format!(
+                "*** Shift goal of {} reached - brilliant work, {first}! ***",
+                app.money(goal)
+            ),
+            false,
+        );
     }
     Screen::Done {
         change: sale.change,
@@ -2008,8 +2151,8 @@ const MENU: &[&str] = &[
     "Export to USB (journal, reports, catalog)",
     "Import catalog from USB (CATALOG.CSV)",
     "Import settings from USB (SETTINGS.TXT)",
-    "Add cashier",
-    "Add manager",
+    "Add user",
+    "Settings (users, roles, goal, sign-out)",
     "Unlock user",
     "Journal status",
     "Import pictures from USB (IMG_<SKU>.JPG, LOGO, WALLPAPER)",
@@ -2018,6 +2161,141 @@ const MENU: &[&str] = &[
     "Network status",
     "Back",
 ];
+
+/// The menu's items by section, with the short label drawn on the tile.
+const MENU_GROUPS: &[(&str, &[(usize, &str)])] = &[
+    (
+        "Sales & receipts",
+        &[
+            (0, "X report"),
+            (1, "Z report - close day"),
+            (4, "Refund"),
+            (5, "No sale - open drawer"),
+            (2, "Reprint last receipt"),
+            (3, "Reprint by number"),
+        ],
+    ),
+    (
+        "USB stick",
+        &[
+            (6, "Export journal & reports"),
+            (14, "Export stock list"),
+            (7, "Import catalog"),
+            (13, "Import pictures"),
+            (8, "Import settings"),
+        ],
+    ),
+    (
+        "Team & store",
+        &[
+            (9, "Add user"),
+            (11, "Unlock user"),
+            (10, "Settings"),
+            (15, "Network setup"),
+            (16, "Network status"),
+            (12, "Journal status"),
+        ],
+    ),
+];
+
+/// Permission each menu item needs (None: anyone).
+fn menu_permission(i: usize) -> Option<Permission> {
+    use Permission as P;
+    Some(match i {
+        0 => P::XReport,
+        1 => P::ZReport,
+        2 | 3 => P::Reprint,
+        4 => P::Refund,
+        5 => P::NoSale,
+        6 | 14 => P::Export,
+        7 => P::Import,
+        8 | 15 => P::Configure,
+        9 => P::ManageUsers,
+        11 => P::UnlockUser,
+        13 => P::ManageCatalog,
+        _ => return None,
+    })
+}
+
+fn draw_menu(ui: &mut Ui<'_>, body: Rect, sel: usize, ok: &[bool]) -> Option<UiAction> {
+    let u = ui.u();
+    let t = ui.theme;
+    let mut action = None;
+    let (title, r) = body.split_top(7 * u);
+    ui.label(title, "Menu", Font::Large, 1);
+    let (cols_r, foot) = r.split_bottom(8 * u);
+    let n = MENU_GROUPS.len() as i32;
+    let cols = cols_r.grid(n, 1, 2 * u);
+    let rows = MENU_GROUPS.iter().map(|g| g.1.len()).max().unwrap_or(1) as i32;
+    let hh = ui.c.line_height(Font::Bold) + 2 * u;
+    let sh = ui.c.line_height(Font::Small);
+    for ((head, items), col) in MENU_GROUPS.iter().zip(cols) {
+        ui.label_color(
+            Rect::new(col.x + u, col.y, col.w, hh),
+            &head.to_uppercase(),
+            Font::Small,
+            0,
+            t.muted,
+        );
+        let tile_h = ((col.h - hh) / rows).min(10 * u);
+        for (k, (idx, label)) in items.iter().enumerate() {
+            let cell = Rect::new(col.x, col.y + hh + k as i32 * tile_h, col.w, tile_h).inset(u / 3);
+            let chosen = *idx == sel;
+            let bg = if chosen { t.accent } else { t.button };
+            let bg = if ui.pressed_in(cell) {
+                pos_ui::mix(bg, 0x00FF_FFFF, 90)
+            } else {
+                bg
+            };
+            ui.c.fill_round_rect(cell, ui.c.px(6), bg);
+            let inner = cell.inset(u + u / 2);
+            // Shortcut digit badge.
+            let digit = match idx {
+                0..=8 => Some(char::from(b'1' + *idx as u8)),
+                9 => Some('0'),
+                _ => None,
+            };
+            let badge = ui.c.line_height(Font::Small) + u / 2;
+            let mut tx = inner.x;
+            if let Some(d) = digit {
+                let br = Rect::new(inner.x, inner.y + (inner.h - badge) / 2, badge, badge);
+                ui.c.fill_round_rect(br, badge / 4, pos_ui::mix(bg, t.bg, 110));
+                ui.label_color(br, &d.to_string(), Font::Small, 1, t.button_text);
+            }
+            tx += badge + u;
+            let lr = Rect::new(tx, inner.y, inner.x + inner.w - tx, inner.h);
+            let fg = if chosen { t.on_accent } else { t.button_text };
+            let alone = ok.get(*idx).copied().unwrap_or(true);
+            if alone {
+                ui.label_color(lr, label, Font::Bold, 0, fg);
+            } else {
+                let bh = ui.c.line_height(Font::Bold);
+                let top = lr.y + (lr.h - bh - sh) / 2;
+                ui.label_color(Rect::new(lr.x, top, lr.w, bh), label, Font::Bold, 0, fg);
+                ui.label_color(
+                    Rect::new(lr.x, top + bh, lr.w, sh),
+                    "needs approval",
+                    Font::Small,
+                    0,
+                    if chosen { fg } else { t.muted },
+                );
+            }
+            let target = match idx {
+                0..=8 => format!("{}. {}", idx + 1, MENU[*idx]),
+                9 => format!("0. {}", MENU[*idx]),
+                _ => MENU[*idx].to_string(),
+            };
+            if ui.target(cell, &target) {
+                action = Some(UiAction::Menu(*idx));
+            }
+        }
+    }
+    let b = foot.centered(foot.w.min(40 * u), 7 * u);
+    if ui.button(b, "Back", ButtonStyle::Ok) {
+        action = Some(UiAction::Menu(MENU.len() - 1));
+    }
+    action
+}
 
 fn menu_key<D: BlockDevice>(app: &mut App<D>, sel: usize, key: Key, hw: &mut Hw<'_>) -> Screen {
     match key {
@@ -2071,8 +2349,8 @@ fn menu_select<D: BlockDevice>(app: &mut App<D>, i: usize, hw: &mut Hw<'_>) -> S
         6 => authorize(app, Pending::Export, hw),
         7 => authorize(app, Pending::ImportCatalog, hw),
         8 => authorize(app, Pending::ImportSettings, hw),
-        9 => authorize(app, Pending::AddUser(Role::Cashier), hw),
-        10 => authorize(app, Pending::AddUser(Role::Manager), hw),
+        9 => authorize(app, Pending::Admin(AdminAct::AddUser), hw),
+        10 => admin::open(app),
         11 => authorize(app, Pending::Unlock, hw),
         12 => {
             let (used, total) = app.store.as_ref().map(|s| s.usage()).unwrap_or((0, 1));
@@ -2195,6 +2473,31 @@ pub(crate) enum UiAction {
     TogglePad,
     /// A row of the stock list (index into the drawn window).
     StockRow(usize),
+    /// A bar of the sales-by-hour chart.
+    Bar(u8),
+    /// Tender this much cash (quick-cash buttons).
+    Cash(String),
+}
+
+/// Cash the customer is likely to hand over: the exact amount, then the
+/// next multiples of common note sizes above it (at most four buttons).
+pub(crate) fn quick_cash(due: Money, decimals: u8) -> Vec<Money> {
+    let unit = 10i64.pow(u32::from(decimals));
+    let mut out = vec![due];
+    if due.0 <= 0 {
+        return out;
+    }
+    for step in [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000] {
+        let s = step * unit;
+        let up = (due.0 + s - 1) / s * s;
+        if up > due.0 && !out.iter().any(|m| m.0 == up) {
+            out.push(Money(up));
+        }
+        if out.len() == 4 {
+            break;
+        }
+    }
+    out
 }
 
 /// Run one frame with the tap so widgets can see it, then act on it.
@@ -2256,11 +2559,13 @@ pub(crate) fn on_click<D: BlockDevice>(
                 };
             }
         }
-        UiAction::Menu(i) => {
-            if matches!(app.screen, Screen::Menu { .. }) {
-                app.screen = menu_select(app, i, hw);
+        UiAction::Menu(i) => match app.screen {
+            Screen::Menu { .. } => app.screen = menu_select(app, i, hw),
+            Screen::Settings { page, by, .. } => {
+                app.screen = admin::select(app, page, i, by, hw);
             }
-        }
+            _ => {}
+        },
         UiAction::RefundRow(i) => {
             if let Screen::RefundPick { sel, .. } = &mut app.screen {
                 *sel = i;
@@ -2272,6 +2577,17 @@ pub(crate) fn on_click<D: BlockDevice>(
             app.qk_page = (app.qk_page as isize + d).clamp(0, (n - 1).max(0)) as usize;
         }
         UiAction::TogglePad => app.sale_pad = !app.sale_pad,
+        UiAction::Cash(amount) => {
+            if matches!(app.screen, Screen::Pay) {
+                app.entry = amount;
+                key(app, Key::Enter, hw);
+            }
+        }
+        UiAction::Bar(h) => {
+            if let Screen::Reports { hour } = &mut app.screen {
+                *hour = if *hour == Some(h) { None } else { Some(h) };
+            }
+        }
         UiAction::StockRow(k) => {
             if matches!(app.screen, Screen::Stock) {
                 app.stock.sel = app.stock.sel.saturating_sub(16) + k;
@@ -2476,8 +2792,13 @@ struct View {
     choices: Vec<(String, String)>,
     desk: Option<crate::desktop::DeskView>,
     stock: Option<stock::StockView>,
+    settings: Option<admin::SettingsView>,
+    /// Per menu item: may the signed-in user do it without approval?
+    menu_ok: Vec<bool>,
+    reports: Option<crate::reports::ReportsView>,
     qk_pics: alloc::collections::BTreeMap<String, alloc::sync::Arc<pos_ui::image::Bitmap>>,
     signed_in: bool,
+    left_handed: bool,
 }
 
 fn prompt_choices<D: BlockDevice>(app: &App<D>, next: &Next, now: i64) -> Vec<(String, String)> {
@@ -2493,7 +2814,8 @@ fn prompt_choices<D: BlockDevice>(app: &App<D>, next: &Next, now: i64) -> Vec<(S
         Next::LoginUser => users(&|_| true),
         Next::AdoptUser => users(&|u| u.role == Role::Manager),
         Next::OverrideUser(p) => users(&|u| app.state.allows(u.id, p.permission())),
-        Next::UnlockUser => users(&|u| app.state.is_locked(u.id, now)),
+        Next::UnlockUser(_) => users(&|u| app.state.is_locked(u.id, now)),
+        Next::NewUserRole(..) | Next::IdleMins(_) | Next::SaverMins(_) => admin::choices(next),
         Next::NetRole => vec![
             ("Standalone".into(), "1".into()),
             ("Head till".into(), "2".into()),
@@ -2587,11 +2909,20 @@ fn view<D: BlockDevice>(app: &App<D>, now: i64) -> View {
         choices,
         desk: None,
         stock: stock::view(app),
+        settings: admin::view(app),
+        menu_ok: (0..MENU.len())
+            .map(|i| match (menu_permission(i), app.user) {
+                (Some(p), Some(u)) => app.state.allows(u, p),
+                _ => true,
+            })
+            .collect(),
+        reports: crate::reports::view(app),
         qk_pics: app
             .state
             .catalog
             .quick_keys()
             .into_iter()
+            .filter(|_| app.state.ui.key_pictures)
             .filter_map(|i| {
                 app.gallery
                     .get(&PictureFor::Item(i.sku.clone()))
@@ -2599,9 +2930,18 @@ fn view<D: BlockDevice>(app: &App<D>, now: i64) -> View {
             })
             .collect(),
         signed_in: app.user.is_some(),
+        left_handed: app.state.ui.left_handed,
         screen,
         cfg,
     }
+}
+
+/// The colours this till's settings ask for.
+pub(crate) fn theme_for(p: &pos_core::ui::UiPrefs) -> pos_ui::Theme {
+    use pos_core::ui::ThemeMode;
+    let light = p.theme == ThemeMode::Light;
+    let base = if light { pos_ui::LIGHT } else { pos_ui::THEME };
+    base.with_accent(p.accent.rgb(), light)
 }
 
 fn is_desktop(s: &Screen) -> bool {
@@ -2644,7 +2984,15 @@ pub(crate) fn draw<D: BlockDevice>(
     if is_desktop(&v.screen) {
         v.desk = Some(crate::desktop::view(app, now));
     }
+    let prefs = app.state.ui.clone();
+    app.canvas.set_text_scale(prefs.text.permille());
     let mut ui = Ui::new(&mut app.canvas, ptr, held_from);
+    ui.theme = theme_for(&prefs);
+    if app.saver {
+        crate::desktop::draw_saver(&mut ui, &v.cfg.store_name, now);
+        app.targets.clear();
+        return None;
+    }
     let mut action = None;
     if let Some(d) = &v.desk {
         action = match &v.screen {
@@ -2675,6 +3023,8 @@ pub(crate) fn draw<D: BlockDevice>(
                 | Screen::Info { .. }
                 | Screen::Stock
                 | Screen::StockItem(_)
+                | Screen::Settings { .. }
+                | Screen::Reports { .. }
         );
     let top = if home_able {
         let (h, rest) = top.split_left(ui.c.text_width("Home", Font::Bold) + 3 * u);
@@ -2689,7 +3039,7 @@ pub(crate) fn draw<D: BlockDevice>(
     if let Some((m, err)) = &v.message {
         let col = if *err { ui.theme.danger } else { ui.theme.ok };
         ui.c.fill_rect(bottom, col);
-        ui.label_color(bottom.inset(u), m, Font::Bold, 0, ui.theme.button_text);
+        ui.label_color(bottom.inset(u), m, Font::Bold, 0, ui.theme.on_accent);
     }
     let body = body.inset(u);
     let money = |m: Money| format!("{}", m.display(v.cfg.decimals));
@@ -2708,6 +3058,20 @@ pub(crate) fn draw<D: BlockDevice>(
             }
         }
         Screen::Home => {}
+        Screen::Reports { .. } => {
+            if let Some(rv) = &v.reports
+                && let Some(a) = crate::reports::draw(&mut ui, body, rv)
+            {
+                action = Some(a);
+            }
+        }
+        Screen::Settings { .. } => {
+            if let Some(sv) = &v.settings
+                && let Some(a) = admin::draw(&mut ui, body, sv)
+            {
+                action = Some(a);
+            }
+        }
         Screen::Stock => {
             if let Some(s) = &v.stock
                 && let Some(a) = stock::draw_list(&mut ui, body, s)
@@ -2755,34 +3119,8 @@ pub(crate) fn draw<D: BlockDevice>(
             }
         }
         Screen::Menu { sel } => {
-            let (t, r) = body.split_top(7 * u);
-            ui.label(t, "Manager menu", Font::Large, 1);
-            // Two columns of buttons; digits 1-9, 0 still pick from the keyboard.
-            let rows = (MENU.len() as i32 + 1) / 2;
-            let cell_h = (9 * u).min((r.h - u) / rows);
-            let grid = r.centered(r.w.min(120 * u), rows * cell_h);
-            let cells = grid.grid(2, rows, u / 2);
-            let labels: Vec<String> = MENU
-                .iter()
-                .enumerate()
-                .map(|(k, item)| match k {
-                    0..=8 => format!("{}. {item}", k + 1),
-                    9 => format!("0. {item}"),
-                    _ => (*item).to_string(),
-                })
-                .collect();
-            let font = ui
-                .grid_font(cells[0], labels.iter().map(String::as_str))
-                .min_bold();
-            for (k, (label, cell)) in labels.iter().zip(cells).enumerate() {
-                let style = if k == *sel {
-                    ButtonStyle::Primary
-                } else {
-                    ButtonStyle::Normal
-                };
-                if ui.button_font(cell, label, style, font) {
-                    action = Some(UiAction::Menu(k));
-                }
+            if let Some(a) = draw_menu(&mut ui, body, *sel, &v.menu_ok) {
+                action = Some(a);
             }
         }
         Screen::Info { title, lines } => {
@@ -2926,8 +3264,17 @@ fn draw_sale(
         Screen::Done { change, receipt } => Some((change, receipt)),
         _ => None,
     };
-    let (left, right) = body.split_left(body.w * 3 / 5);
-    let left = Rect::new(left.x, left.y, left.w - u, left.h);
+    // Left-handed: keys on the left, the basket on the right.
+    let (left, right) = if v.left_handed {
+        let (keys, basket) = body.split_left(body.w * 2 / 5);
+        (
+            Rect::new(basket.x + u, basket.y, basket.w - u, basket.h),
+            keys,
+        )
+    } else {
+        let (basket, keys) = body.split_left(body.w * 3 / 5);
+        (Rect::new(basket.x, basket.y, basket.w - u, basket.h), keys)
+    };
 
     // ---- left: lines (the finished sale's lines on the Done screen)
     ui.panel(left);
@@ -3074,6 +3421,35 @@ fn draw_sale(
                 ui.label(r, a, Font::Bold, 2);
             }
             let rest = Rect::new(rest.x, rest.y + u, rest.w, rest.h - u);
+            // Quick cash: exact, then the next round amounts above it.
+            let (chips, rest) = rest.split_top(7 * u);
+            let quick = quick_cash(due, v.cfg.decimals);
+            let cells = chips.grid(quick.len().max(1) as i32, 1, u / 2);
+            let labels: Vec<String> = quick
+                .iter()
+                .enumerate()
+                .map(|(k, m)| {
+                    if k == 0 {
+                        format!("Exact {}", money(*m))
+                    } else {
+                        money(*m)
+                    }
+                })
+                .collect();
+            let font = ui.grid_font(cells[0], labels.iter().map(String::as_str));
+            for ((label, m), cell) in labels.iter().zip(&quick).zip(cells) {
+                let style = if label.starts_with("Exact") {
+                    ButtonStyle::Ok
+                } else {
+                    ButtonStyle::Normal
+                };
+                if ui.button_font(cell, label, style, font) {
+                    action = Some(UiAction::Cash(
+                        format!("{}", m.display(v.cfg.decimals)).replace(',', ""),
+                    ));
+                }
+            }
+            let rest = Rect::new(rest.x, rest.y + u / 2, rest.w, rest.h - u / 2);
             let (pad, tenders) = rest.split_bottom(8 * u);
             if let Some(a) = numpad(ui, Rect::new(pad.x, pad.y, pad.w, pad.h - u), Pad::Pay) {
                 action = Some(a);
@@ -3095,7 +3471,7 @@ fn draw_sale(
         Screen::Done { change, .. } => {
             ui.c.fill_round_rect(rest, ui.c.px(6), ui.theme.ok);
             let inner = rest.inset(2 * u);
-            let white = ui.theme.button_text;
+            let white = ui.theme.on_accent;
             let lh = ui.c.line_height(Font::Bold) + u;
             let big = ui.c.line_height(Font::Huge);
             let mut rows: Vec<(String, String)> = Vec::new();

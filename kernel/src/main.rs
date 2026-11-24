@@ -27,6 +27,7 @@ mod pci;
 mod power;
 mod rng;
 mod serial;
+mod speaker;
 mod usb;
 mod xhci;
 
@@ -115,6 +116,7 @@ extern "C" fn kmain2() -> ! {
     let mut input = usb::UsbInput {
         stack: stack.clone(),
     };
+    let mut speaker = speaker::Speaker;
     let mut media = usb::UsbMedia {
         stack: stack.clone(),
     };
@@ -160,6 +162,8 @@ extern "C" fn kmain2() -> ! {
             printer: &mut printer,
             rng: &mut entropy,
             media: &mut media,
+            wifi: &mut pos_hal::NoWifi,
+            sound: &mut speaker,
         };
         if let Some(n) = &mut network {
             n.step(&mut app, &mut hw, clock.monotonic_us() / 1000);

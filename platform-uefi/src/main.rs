@@ -22,6 +22,8 @@ mod media;
 mod net;
 mod printer;
 mod rng;
+mod speaker;
+mod wifi;
 
 use core::time::Duration;
 use pos_app::{App, Control, Hw};
@@ -69,6 +71,8 @@ fn main() -> Status {
     let (key, key_src) = keyvar::machine_key(&mut entropy);
     let mut printer = printer::UefiPrinter::init();
     let mut media = media::UsbMedia::new();
+    let mut wifi = wifi::UefiWifi::init();
+    let mut speaker = speaker::Speaker;
     let Some(mut input) = input::UefiInput::init(w, h) else {
         fatal_screen(&mut disp, "No keyboard input available")
     };
@@ -122,6 +126,8 @@ fn main() -> Status {
             printer: &mut printer,
             rng: &mut entropy,
             media: &mut media,
+            wifi: &mut wifi,
+            sound: &mut speaker,
         };
         app.render(&mut hw);
     }
@@ -144,8 +150,8 @@ fn main() -> Status {
             };
             let _ = boot::set_timer(&events[tick_index], TimerTrigger::Periodic(period));
         }
-        if fast && network.is_none() && !nic_missing {
-            match net::UefiNic::init() {
+        if fast && network.is_none() && !nic_missing && app.wifi_settled() {
+            match net::UefiNic::init(app.wifi_preferred()) {
                 Some(n) => network = Some(pos_app::sync::Network::new(n)),
                 None => {
                     nic_missing = true;
@@ -159,6 +165,8 @@ fn main() -> Status {
             printer: &mut printer,
             rng: &mut entropy,
             media: &mut media,
+            wifi: &mut wifi,
+            sound: &mut speaker,
         };
         if let Some(n) = &mut network {
             n.step(&mut app, &mut hw, clock_now(&clock) / 1000);

@@ -24,11 +24,13 @@ pub mod fiscal;
 pub mod inventory;
 pub mod media;
 pub mod money;
+pub mod policy;
 pub mod sale;
 pub mod shift;
 pub mod state;
 pub mod sync;
 pub mod tender;
+pub mod ui;
 
 pub use money::{Money, Qty, Rate, Rounding};
 pub use state::{DomainError, Event, PosState};

@@ -144,3 +144,77 @@ pub struct Report {
     pub grand_total: Money,
     pub extra: Vec<alloc::string::String>,
 }
+
+/// Figures per product for [`ShiftStats`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemStats {
+    pub name: alloc::string::String,
+    pub qty: i64,
+    pub total: Money,
+}
+
+/// Running figures for the Reports app: sales by hour of day, by product
+/// and by cashier for the current (or last) shift. Kept in the state so
+/// they survive a reboot; not part of X/Z reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShiftStats {
+    pub shift_id: u32,
+    /// Hour of day (0-23, till clock) → (sales, sales total).
+    pub hours: BTreeMap<u8, (u32, Money)>,
+    /// SKU → figures (net of refunds).
+    pub items: BTreeMap<alloc::string::String, ItemStats>,
+    /// Cashier → (sales, sales total).
+    pub cashiers: BTreeMap<UserId, (u32, Money)>,
+}
+
+impl ShiftStats {
+    pub fn new(shift_id: u32) -> Self {
+        ShiftStats {
+            shift_id,
+            ..Self::default()
+        }
+    }
+
+    pub fn hour_of(at: i64) -> u8 {
+        (at.rem_euclid(86_400) / 3600) as u8
+    }
+
+    /// Saturating: statistics never block a sale.
+    pub fn add_sale(&mut self, s: &Sale) {
+        let add = |m: Money, v: Money| Money(m.0.saturating_add(v.0));
+        let h = self.hours.entry(Self::hour_of(s.at)).or_default();
+        h.0 = h.0.saturating_add(1);
+        h.1 = add(h.1, s.totals.total);
+        let c = self.cashiers.entry(s.cashier).or_default();
+        c.0 = c.0.saturating_add(1);
+        c.1 = add(c.1, s.totals.total);
+        for l in &s.lines {
+            let e = self.items.entry(l.line.sku.clone()).or_default();
+            e.name.clone_from(&l.line.name);
+            e.qty = e.qty.saturating_add(l.line.qty.0);
+            e.total = add(e.total, l.priced.total);
+        }
+    }
+
+    pub fn add_refund(&mut self, r: &Refund) {
+        for l in &r.lines {
+            if let Some(e) = self.items.get_mut(&l.sku) {
+                e.qty = e.qty.saturating_sub(l.qty.0);
+                e.total = Money(e.total.0.saturating_sub(l.total.0));
+            }
+        }
+    }
+
+    /// Best sellers by takings, most first.
+    pub fn top_items(&self, n: usize) -> Vec<(&str, &ItemStats)> {
+        let mut v: Vec<_> = self
+            .items
+            .iter()
+            .filter(|(_, i)| i.total.0 > 0)
+            .map(|(k, i)| (k.as_str(), i))
+            .collect();
+        v.sort_by(|a, b| b.1.total.cmp(&a.1.total).then(a.0.cmp(b.0)));
+        v.truncate(n);
+        v
+    }
+}

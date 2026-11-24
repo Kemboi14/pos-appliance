@@ -28,7 +28,9 @@ impl core::fmt::Debug for UefiNic {
 }
 
 impl UefiNic {
-    pub fn init() -> Option<UefiNic> {
+    /// Open the first usable card: the Wi-Fi one first when `prefer_wifi`
+    /// (joined through `wifi::UefiWifi`), otherwise wired cards first.
+    pub fn init(prefer_wifi: bool) -> Option<UefiNic> {
         let find = || {
             boot::find_handles::<SimpleNetwork>()
                 .ok()
@@ -47,6 +49,9 @@ impl UefiNic {
                 find()?
             }
         };
+        let radios = crate::wifi::UefiWifi::nic_handles();
+        let mut handles = handles;
+        handles.sort_by_key(|h| radios.contains(h) != prefer_wifi);
         for h in handles {
             let Ok(mut snp) = boot::open_protocol_exclusive::<SimpleNetwork>(h) else {
                 continue;

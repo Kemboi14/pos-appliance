@@ -838,9 +838,9 @@ fn e2e(kernel: bool, hub: bool) -> Res<()> {
         q.type_str("1234\n", human)?;
         q.type_str("1234\n", human)?;
         pause(1500);
-        q.type_str("1\n", human)?;
-        q.type_str("1234\n", human)?;
-        pause(1500);
+        // Signed straight in; keep the default store name.
+        q.type_str("\n", human)?;
+        pause(800);
         q.screendump(&out.join("e2e_0_home.ppm"))?;
         q.type_str("\n", human)?; // open the Till app
         pause(300);
@@ -889,7 +889,7 @@ fn e2e(kernel: bool, hub: bool) -> Res<()> {
     let r2 = (|| -> Res<()> {
         let mut q = qemu::Qmp::connect(&qmp_path, Duration::from_secs(10))?;
         wait_ui(&mut q, &out, Duration::from_secs(90))?;
-        q.type_str("1\n", human)?;
+        q.type_str("alice\n", human)?; // sign in by name
         q.type_str("1234\n", human)?;
         pause(1500);
         q.key("f10", &[])?;
@@ -1333,8 +1333,8 @@ fn net_e2e(kernel: bool) -> Res<()> {
         }
         h.type_str("Alice\n1234\n1234\n", human)?;
         pause(1500);
-        h.type_str("1\n1234\n", human)?;
-        pause(1500);
+        h.type_str("\n", human)?; // signed in; default store name
+        pause(800);
         h.key("f10", &[])?;
         pause(300);
         h.type_str("8", human)?;
@@ -1363,8 +1363,8 @@ fn net_e2e(kernel: bool) -> Res<()> {
         }
         l.type_str("Bob\n1111\n1111\n", human)?;
         pause(1500);
-        l.type_str("1\n1111\n", human)?;
-        pause(1500);
+        l.type_str("\n", human)?; // signed in; default store name
+        pause(800);
         menu_network(&mut l)?;
         l.type_str(&format!("3\n2\n{code}\n10.0.0.2/24\n10.0.0.1\n"), human)?;
         pause(1000);
